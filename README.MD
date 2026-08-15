@@ -1,18 +1,18 @@
 <p align="center">
-  <img src="Useful Information/DragonsLair.png" width="800">
+  <img src="Useful Information/Robots.png" width="800">
 </p>
 
-<h1 align="center">Dragon's Lair FPGA Core</h1>
+<h1 align="center">Isaac Asimov's Robots FPGA Core</h1>
 
 <p align="center">
-  Arcade hardware implementation for MiSTer FPGA
+  VCR hardware implementation for MiSTer FPGA
 </p>
 
 ---
 
 ## Overview
 
-FPGA implementation of **Dragon's Lair (1983)**, originally developed and released by Cinematronics.
+FPGA implementation of **Isaac Asimov's Robots (1988)**, originally developed and released by Kodak.
 
 This core targets MiSTer FPGA and aims for accurate gameplay behavior, video timing, and sound reproduction.
 
@@ -22,11 +22,11 @@ This core targets MiSTer FPGA and aims for accurate gameplay behavior, video tim
 
 | Field        | Value |
 |--------------|--------|
-| Core Name    | DragonsLair |
-| Year         | 1983 |
-| Developer    | Cinematronics |
-| Genre        | LaserDisc |
-| Players      | 1–2 alternating |
+| Core Name    | Robots |
+| Year         | 1988 |
+| Developer    | Kodak |
+| Genre        | VCR |
+| Players      | Everyone |
 
 ---
 
@@ -34,48 +34,36 @@ This core targets MiSTer FPGA and aims for accurate gameplay behavior, video tim
 
 Default MiSTer gamepad mapping:
 
-| Dragon's Lair |
+| Robots |
 | Input | Action |
 |-------|--------|
-| D-Pad / Joystick | Move |
-| A | Sword |
-| B | Not Used |
+| D-Pad / Joystick | Move Selection |
+| A | Select/Activate Item |
+| B | Return/Revert Selection |
 | X | Not Used |
 | Y | Not Used |
-| Select | Insert Coin |
-| Start | 1 Player Start |
-| Right Shoulder | 2 Player Start |
-| Left Shoulder | Pause |
-
-| Space Ace |
-| Input | Action |
-|-------|--------|
-| D-Pad / Joystick | Move |
-| A | Fire / Energize |
-| B | Cadet Level Select |
-| X | Captian Level Select |
-| Y | Space Ace Level Select |
-| Select | Insert Coin |
-| Start | 1 Player Start |
-| Right Shoulder | 2 Player Start |
-| Left Shoulder | Pause |
+| Select | Select Difficulty |
+| Start | Start / Pause Playback |
+| Right Shoulder | Not Used |
+| Left Shoulder | Not Used |
 
 ---
 
 ## Features
 
-- Arcade-accurate CPU timing
-- LaserDisc Simulated, but not fully accurate
+- VCR Simulated to provided video/audio stream
 - MiSTer-compatible .mra provided
-- Verified ROM definitions with checksums
 
 ---
 
 ## ROM Requirements
 
+This title doesn't require 'ROMS' as other games do - only the Robots.dlv file
+
 ROM files are **not included**.
 
-To use this arcade core, you must provide legally obtained ROM files.
+To use this core, you must provide legally obtained files.  You may create your own
+files using your original media and the scripts provided.
 
 To simplify setup:
 
@@ -92,9 +80,9 @@ https://github.com/MiSTer-devel/Main_MiSTer/wiki/Arcade-Roms
 
 ## Installation
 
-1. Copy the core `.rbf` file to your MiSTer `/_Arcade/cores` folder.
-2. Copy the '.mra' file to your MiSTer '/_Arcade' folder.
-3. Place the appropriate ROM `.zip` files in your `/games/mame` directory.
+1. Copy the core `.rbf` file to your MiSTer `/_VCR/cores` folder.
+2. Copy the '.mra' file to your MiSTer '/_VCR' folder.
+3. Place the appropriate ROM `.zip` files in your `/games/robots` directory.
 4. Launch the core from the MiSTer Arcade menu.
 
 ---
@@ -112,6 +100,6 @@ Do not request ROM files in issues or discussions.
 ## Credits
 
 FPGA core development: RodimusFVC 
-Original arcade game © Cinematronics
+Original game © Eastman Kodak Company
 
 ---
