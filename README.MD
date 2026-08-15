@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Useful Information/Robots.png" width="800">
+  <img src="Useful Information/Robots.jpg" width="800">
 </p>
 
 <h1 align="center">Isaac Asimov's Robots FPGA Core</h1>
