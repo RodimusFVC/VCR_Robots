@@ -42,10 +42,10 @@ Default MiSTer gamepad mapping:
 | B | Return/Revert Selection |
 | X | Not Used |
 | Y | Not Used |
-| Select | Select Difficulty |
+| Select | Restart / Reset Game |
 | Start | Start / Pause Playback |
-| Right Shoulder | Not Used |
-| Left Shoulder | Not Used |
+| Right Shoulder | Seek to Next Index |
+| Left Shoulder | Seek to Prior Index |
 
 ---
 
@@ -82,7 +82,7 @@ https://github.com/MiSTer-devel/Main_MiSTer/wiki/Arcade-Roms
 
 1. Copy the core `.rbf` file to your MiSTer `/_VCR/cores` folder.
 2. Copy the '.mra' file to your MiSTer '/_VCR' folder.
-3. Place the appropriate ROM `.zip` files in your `/games/robots` directory.
+3. Place your `robots.dlv` in the `/games/robots` directory (no ROM `.zip` is used).
 4. Launch the core from the MiSTer Arcade menu.
 
 ---

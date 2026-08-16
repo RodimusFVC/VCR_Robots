@@ -24,6 +24,10 @@
 // video+audio (user directive — build the real streaming path, drop the hack).
 //============================================================================
 module dlv_streamer #(
+    // CLK-PARAM-2026-08-15: must match the core clock. ACC_MOD IS this value and
+    // the 1-second debug windows derive from it. 28-bit accumulators so clocks
+    // past 67 MHz still fit (26 bits caps at 67.1 MHz).
+    parameter [31:0] CLK_HZ = 32'd40_000_000,
     parameter [16:0] START_FRAME = 17'd1000   // first film frame (skip black leader); free-runs from here
 )(
     input             clk,               // = CLK_40M
@@ -79,7 +83,14 @@ module dlv_streamer #(
     // old-segment audio on release -- i.e. it held but did NOT align. Flush + refill-while-held +
     // release-with-video = the actual alignment the user asked for. (The existing seek_req/jump_w
     // machinery re-points aud_lba to the new segment, so the refill sources the correct audio.)
-    input             seek_flush
+    input             seek_flush,
+
+    // DIAG-REVERT-2026-08-15: A/V-sync instrumentation. Read-only counters, no
+    // behavioural effect -- delete these two ports and the block above endmodule
+    // to revert. They exist to answer "WHY did the audio fail to drain?" without
+    // anyone having to judge lip-sync direction by ear.
+    output     [11:0] dbg_aud_level,      // LIVE ring occupancy (0..4095)
+    output reg [11:0] dbg_credit_rate     // credit-blocked ticks in the LAST SECOND
 );
     //------------------------------------------------------------------------
     // Compressed-frame BRAM (video)
@@ -135,16 +146,25 @@ module dlv_streamer #(
     //   word[15:0] = L (little-endian bytes 0,1), word[31:16] = R (bytes 2,3)
     // Simple dual-port: one write port (SD fill), one read port (44.1 kHz play).
     //------------------------------------------------------------------------
-    localparam AUD_AW    = 12;                          // 4096 words = 16 KB = ~93 ms
-    localparam [AUD_AW-1:0] FILL_HIGH = {AUD_AW{1'b1}} - 12'd128; // stop filling near-full
-    localparam [AUD_AW-1:0] FILL_LOW  = 12'd2048;                 // require >= half before a video frame
+    // AUD-DEPTH-2026-08-15: 12 -> 14. 4096 words = 93 ms was too shallow for this
+    // core's bandwidth. Measured on HW: with NOTHING muting (cause bits 0) the drain
+    // still fell up to ~1536 samples/s short, because the video fetch is gated on
+    // `aud_level >= FILL_LOW` (:783) -- audio and video throttle each other, and a
+    // 93 ms buffer cannot ride out the bursts. Robots streams ~0.78 MB/s against
+    // DL's proven ~0.52, exactly the 1.5x envelope the design note flagged before
+    // any RTL existed; DL never binds this gate, we sit on it permanently.
+    // 16384 words = 64 KB = ~372 ms. Costs BRAM we freed by deleting T80 + jt49.
+    // ORIGINAL: localparam AUD_AW = 12;   // 4096 words = 16 KB = ~93 ms
+    localparam AUD_AW    = 14;                          // 16384 words = 64 KB = ~372 ms
+    localparam [AUD_AW-1:0] FILL_HIGH = {AUD_AW{1'b1}} - 14'd512; // stop filling near-full
+    localparam [AUD_AW-1:0] FILL_LOW  = 14'd8192;                 // require >= half before a video frame
     reg [31:0] aud_ring [0:(1<<AUD_AW)-1];
     reg [AUD_AW-1:0] aud_wr, aud_rd;
     wire [AUD_AW-1:0] aud_level = aud_wr - aud_rd;       // mod-2^AW occupancy (fill is capped so never wraps past)
     // SEEK-HOLD-2026-07-20: "enough audio buffered to resume after a seek". Deliberately deeper
     // than FILL_LOW (which only gates STARTING a video frame) so playback resumes with margin
     // rather than on the edge of underrun. 3072 words = ~70 ms @44.1 kHz.
-    localparam [AUD_AW-1:0] SEEK_FILL = 12'd3072;
+    localparam [AUD_AW-1:0] SEEK_FILL = 14'd12288;
     assign aud_primed = (aud_level >= SEEK_FILL);
 
     reg [23:0] aud_word_asm;                             // lanes 0..2 assembled during fill
@@ -215,8 +235,12 @@ module dlv_streamer #(
     // the LED band; that needs led_digits_flat, which currently carries the real
     // score/lives, so it is the user's call.  Until then Quartus will strip these three
     // and report them unused -- expected, not a mistake.  The FIX above works regardless.
-    localparam [21:0] WD_LIMIT = 22'd2000000;   // 50 ms @ 40 MHz
-    reg  [21:0] wd_cnt;
+    // CLK-PARAM-2026-08-15: was a hardcoded 2,000,000 = "50 ms @ 40 MHz". At 100 MHz
+    // that same COUNT is 20 ms -- SHORTER than a 33.4 ms frame period -- so the wedge
+    // watchdog would abort legitimate fetches forever and no frame could complete.
+    // Derived so 50 ms stays 50 ms at any clock. 24 bits covers up to ~335 MHz.
+    localparam [23:0] WD_LIMIT = CLK_HZ[23:0] / 24'd20;   // 50 ms at any CLK_HZ
+    reg  [23:0] wd_cnt;
     reg  [3:0]  wd_rst_cnt;                     // holds dec_reset for 16 clk after an abort
     reg  [3:0]  wd_state;                       // state that timed out
     reg  [16:0] wd_frame;                       // ld_curr_frame at the wedge
@@ -290,13 +314,18 @@ module dlv_streamer #(
     //------------------------------------------------------------------------
     // 44.1 kHz sample tick (fractional accumulator: exact average rate)
     //------------------------------------------------------------------------
-    localparam [25:0] ACC_INC = 26'd44100;
-    localparam [25:0] ACC_MOD = 26'd40000000;
-    reg [25:0] samp_acc;
+    // AUDIO-RATE-2026-08-15: 44100 -> 22050, matching robots.dlv repacked with
+    // --srate 22050. MUST track the packer's SRATE (header @32) or audio plays at
+    // the wrong speed. Halving it also DOUBLES the ring's TIME for free -- the ring
+    // holds a fixed sample COUNT, so 16384 words is 372 ms at 44.1k and 743 ms here.
+    // ORIGINAL: localparam [25:0] ACC_INC = 26'd44100;
+    localparam [27:0] ACC_INC = 28'd22050;
+    localparam [27:0] ACC_MOD = CLK_HZ[27:0];
+    reg [27:0] samp_acc;
     reg        samp_tick;
     always @(posedge clk) begin
         samp_tick <= 1'b0;
-        if (reset) samp_acc <= 26'd0;
+        if (reset) samp_acc <= 28'd0;
         else if (!pause) begin                       // HLE-DRIVE-2026-07-04: freeze audio position on pause
             if (samp_acc + ACC_INC >= ACC_MOD) begin
                 samp_acc  <= samp_acc + ACC_INC - ACC_MOD;
@@ -404,7 +433,49 @@ module dlv_streamer #(
     // FILM_PERIOD the TRUE 23.976 fps -- do NOT do that now: it would also shift the display
     // cadence ratio and the CADENCE-FIX-2026-07-24 refresh change is HW-CONFIRMED GOOD.
     // ⚠️ If FILM_PERIOD is ever changed, THIS CONSTANT MUST CHANGE WITH IT (= 44100/film_fps).
-    localparam [13:0] SAMP_PER_TICK = 14'd1842;
+    // ROBOTS-RATE-2026-08-15: retuned for 29.97 fps. The line above ends "If FILM_PERIOD is ever
+    // changed, THIS CONSTANT MUST CHANGE WITH IT (= 44100/film_fps)" -- and it just did:
+    // Robots.sv's FILM_PERIOD is 1,334,667 cyc = 29.97 fps, versus DL's 1,670,983 = 23.938 fps.
+    //   44100 / 29.97 = 1471.47 -> 1471
+    // Supply = 29.97 * 1471 = 44,085 /s = 99.97% of the 44,100 Hz drain, the same class of fit
+    // DL had at 99.99%. This is also the one case where the credit and the container ratio agree
+    // exactly rather than by luck: robots.dlv packs 477,113,840/4 audio samples over 81,065
+    // frames = 1471.4 samples/frame (pack report: samp/frame 1471.47), because Robots' content
+    // rate IS the 29.97 disc rate -- there is no film-vs-disc mismatch to absorb.
+    // ---- AV-SYNC-2026-08-15: 1471 -> 1472. ROUND UP, NEVER DOWN. -------------------------
+    // Reported symptom: audio drifts out of sync over a long play, plus faint stutter.
+    //
+    // The drain is an EXACT 44,100 Hz (fractional accumulator above, 44100/40000000), but the
+    // credit supply at 1471 is 29.97 * 1471 = 44,085 /s -- SHORT by 15 samples every second.
+    // aud_drain is gated on aud_credit != 0, so the deficit makes the credit the binding
+    // constraint: audio plays 0.034% slow and the drain stalls in small gaps (the stutter).
+    // Being one linear 45-minute play, that integrates to ~0.2 s behind at 10 min and ~0.9 s
+    // by the end.
+    //
+    // WHY DL NEVER SHOWED THIS: 1842 is short by 6/s as well, but every SEARCH re-anchors the
+    // audio (seek_flush + re-point), so DL's error can never accumulate past one scene. Robots
+    // performs NO seeks during play, so nothing ever re-anchors it. The rounding direction that
+    // was harmless on DL is not harmless here.
+    //
+    // 1472 makes supply 44,115 /s, i.e. 15 /s MORE than the drain, so the credit stops being
+    // the limiter and the drain free-runs at its exact 44,100 Hz. Sync is then governed by the
+    // container, which is exactly matched: the packer wrote 1471.47 samples/frame and
+    // 29.97 * 1471.47 = 44,100.0. Frame-lock still works -- on a hold, aud_fadv is 0, no credit
+    // is added, and the drain stops within the AUD_CREDIT_MAX cushion.
+    // ⚠️ Side effect to watch: with surplus credit the cushion now actually FILLS, so a pause
+    // may trail up to AUD_CREDIT_MAX (7368 samples = 167 ms) of audio after the picture stops.
+    // Left alone deliberately -- change one variable at a time.
+    //
+    // ORIGINAL (Dragon's Lair / Space Ace / Thayer's Quest, 23.938 fps):
+    // localparam [13:0] SAMP_PER_TICK = 14'd1842;
+    // ROBOTS-RATE-2026-08-15 (rounded DOWN -- this is the bug):
+    // localparam [13:0] SAMP_PER_TICK = 14'd1471;
+    // AUDIO-RATE-2026-08-15: 22050/29.97003 = 735.74 -> 736. ROUND UP, always:
+    // rounding DOWN makes the credit the limiter and audio plays slow (that was the
+    // 1471 bug). At 736 supply is 29.97*736 = 22,058/s against a 22,050/s drain, so
+    // credit never binds and the container ratio sets sync.
+    // ORIGINAL (44.1 kHz): localparam [13:0] SAMP_PER_TICK = 14'd1472;
+    localparam [13:0] SAMP_PER_TICK = 14'd736;
     // ORIGINAL (credit came from the container ratio -- the regression):
     // wire [14:0] aud_add   = (aud_jump)          ? 15'd0 :
     //                         (aud_fadv == 17'd1) ? {1'b0, samp_per_frame} :
@@ -533,7 +604,31 @@ module dlv_streamer #(
 
     // audio target sector = aud_lba_start + (disc_rel * samples_per_frame) / 128 samples-per-sector
     // >>16 undoes the Q16 scaling and >>7 converts samples to sectors, hence >>23.
-    wire [46:0] aud_prod_q16   = disc_rel * spf_q16;
+    // ---- AV-OFFSET-2026-08-15: audio leads picture by the VIDEO PIPELINE LATENCY ----
+    // Measured on HW: ring level oscillates 0x200-0x7FF (rides the FILL_LOW=0x800 video-fetch
+    // gate and back) and dbg_credit_rate reads 000. So the credit NEVER blocks the drain and the
+    // ring NEVER empties => audio runs continuously at an exact 44,100 Hz, and video advances at
+    // 29.96999 fps against a blob packing 1471.47 samp/frame = 44,100.0/s. The rates MATCH, so
+    // this cannot be drift -- it is a CONSTANT OFFSET, and the user reads audio as slightly AHEAD.
+    //
+    // Cause: audio is drained against ld_curr_frame the instant it advances, but the PICTURE for
+    // frame N appears several frames later -- SD fetch, JPEG decode, fb_writer into DDR, triple
+    // buffer marked ready, then the raster reader adopts it at vblank (it latches frame_base_hw
+    // once per raster frame). Video has 2-3 frames of latency; audio has none.
+    //
+    // Fix: bias the AUDIO position back by that latency, so the samples fetched alongside frame N
+    // are the ones that belong with the picture actually on screen. Applies to the seek/init
+    // re-point, which is where the audio cursor is established; free-run advances from there.
+    // ⚠️ TUNABLE AND UNVERIFIED. 3 frames = 100 ms is the starting estimate. If audio is still
+    // ahead, raise it; if it goes behind, lower it. 0 restores the old behaviour exactly.
+    // Set back to 0 2026-08-15: it did not fix sync, and leaving it in would be a
+    // confounding variable while the drain rate is measured. Restore to 3 (or tune)
+    // only if the measurement shows audio is real-time and the error really is offset.
+    localparam [16:0] AUD_LEAD_FRAMES = 17'd0;
+    wire [16:0] disc_rel_aud   = (disc_rel > AUD_LEAD_FRAMES) ? (disc_rel - AUD_LEAD_FRAMES)
+                                                              : 17'd0;
+    // ORIGINAL: wire [46:0] aud_prod_q16 = disc_rel * spf_q16;
+    wire [46:0] aud_prod_q16   = disc_rel_aud * spf_q16;
     wire [31:0] aud_target_lba = aud_lba_start + {8'd0, aud_prod_q16[46:23]};
 
     // VIDEO-RATIO-2026-07-05: real ratio applied (was a 1:1 placeholder). video_frame =
@@ -652,9 +747,30 @@ module dlv_streamer #(
             seek_req   <= 1'b0;
             seek_armed <= 1'b0;
         end else begin
-            if (seek_flush) seek_armed <= 1'b1;                 // CMD_SEARCH: arm (the ONLY trigger)
-            if (seek_armed && jump_any) begin
-                seek_req   <= 1'b1;                             // commanded frame landed -> re-point
+            // ROBOTS-SEEK-ALIGN-2026-08-15: re-point AT the flush, not on the next jump.
+            //
+            // DL armed on the command and waited for jump_any because the LD-V1000's
+            // command byte PRECEDES the frame landing -- it had to wait to learn where
+            // it landed. Robots is the opposite: ld_search_cmd_o is pulsed one cycle
+            // AFTER frame_ctr is already loaded, so the frame has landed and jump_any
+            // is ALREADY FALSE when the pulse arrives.
+            //
+            // The old code therefore deferred the re-point to the next ld_curr_frame
+            // change -- an ordinary +1 tick up to 33 ms later, or NEVER while paused --
+            // while the ring had ALREADY been flushed and was refilling from the STALE
+            // aud_lba. Flush and re-point were decoupled, so the ring queued
+            // old-position audio behind a flush meant to discard exactly that. That is
+            // the "audio plays at the wrong time after a seek" the user reported, and
+            // startup inherited it once boot was routed through this path.
+            //
+            // ORIGINAL (kept for the DL lineage; restore if this is ever ported back
+            // to a core whose command genuinely precedes the landing):
+            //   if (seek_flush) seek_armed <= 1'b1;
+            //   if (seek_armed && jump_any) begin
+            //       seek_req <= 1'b1; seek_armed <= 1'b0;
+            //   end else if (seek_consume) seek_req <= 1'b0;
+            if (seek_flush) begin
+                seek_req   <= 1'b1;      // frame has already landed: re-point NOW
                 seek_armed <= 1'b0;
             end else if (seek_consume) seek_req <= 1'b0;
         end
@@ -682,13 +798,13 @@ module dlv_streamer #(
             // compute to 0 at boot.
             last_fetched_frame <= {17{1'b1}};
             // WEDGE-WATCHDOG-2026-07-24
-            wd_cnt <= 22'd0; wd_rst_cnt <= 4'd0;
+            wd_cnt <= 24'd0; wd_rst_cnt <= 4'd0;
             wd_state <= 4'd0; wd_frame <= 17'd0; wd_trips <= 16'd0;
         end else begin
             // WEDGE-WATCHDOG-2026-07-24: run the timer BEFORE the case, so a state change or a
             // progress event inside the case re-arms it on the NEXT cycle rather than this one.
-            if (!wd_arm || wd_prog)     wd_cnt <= 22'd0;
-            else if (wd_cnt != WD_LIMIT) wd_cnt <= wd_cnt + 22'd1;
+            if (!wd_arm || wd_prog)     wd_cnt <= 24'd0;
+            else if (wd_cnt != WD_LIMIT) wd_cnt <= wd_cnt + 24'd1;
             if (wd_rst_cnt != 4'd0)      wd_rst_cnt <= wd_rst_cnt - 4'd1;
 
             case (state)
@@ -909,7 +1025,7 @@ module dlv_streamer #(
                 wd_state  <= state;
                 wd_frame  <= ld_curr_frame;
                 wd_trips  <= wd_trips + 16'd1;
-                wd_cnt    <= 22'd0;
+                wd_cnt    <= 24'd0;
                 wd_rst_cnt<= 4'd15;
                 sd_rd     <= 1'b0;
                 out_valid <= 1'b0;
@@ -917,6 +1033,95 @@ module dlv_streamer #(
                 last_fetched_frame <= {17{1'b1}};
                 state     <= S_READY;
             end
+        end
+    end
+
+    //------------------------------------------------------------------------
+    // DIAG-REVERT-2026-08-15: A/V-SYNC DISCRIMINATOR. Delete this whole block and
+    // the two ports to revert. Read-only -- drives nothing but the LED band.
+    //
+    // The audio drain has exactly two possible blockers, and they mean opposite
+    // things. This counts them separately so the cause is a NUMBER, not a
+    // judgement call about whether sound is early or late:
+    //
+    // ⛔ REBUILT 2026-08-15. The first version used two SATURATING TOTALS and was
+    // useless: they capped at 0xEEE = 3,822 events = 0.09 s of sample ticks, so
+    // ANY nonzero rate pegged both within seconds. On HW both read EEE, which
+    // said only "both happen" -- no discrimination at all. Do not go back to
+    // cumulative counters here; the useful quantities are a LEVEL and a RATE.
+    //
+    //   dbg_aud_level   LIVE ring occupancy, 0..4095 (ring is 4096 words = 93 ms).
+    //       Hovers HIGH (near FILL_HIGH 0xF7F)  -> the fill keeps up and the
+    //           CREDIT is the limiter: audio plays slow, drifts BEHIND.
+    //       Hovers LOW / near 0                 -> the FILL is the limiter, i.e.
+    //           SD bandwidth (the ~1.5x-DL concern). Credit tuning cannot fix it.
+    //       Sits comfortably mid/high AND sync is still wrong -> neither rate is
+    //           at fault; it is a fixed pipeline offset, a different fix entirely.
+    //
+    //   dbg_credit_rate credit-blocked ticks in the LAST SECOND, direct count,
+    //       saturating at 0xFFF. Direct (not scaled) on purpose: the deficit we
+    //       are hunting is ~15/s, which reads as 00F. A scaled counter would
+    //       round exactly that case to zero.
+    //
+    // Placed here, after aud_wr/aud_rd (149), samp_tick (303), aud_credit (378)
+    // and aud_muted (382): Quartus 17.0 rejects use-before-declaration.
+    //------------------------------------------------------------------------
+    // 2026-08-15: L repurposed to name the CULPRIT. C proved the loss is real and
+    // bursty (~3100 samples/s = 70 ms lost in a spike) but not WHY. aud_muted has
+    // four causes and the previous counters could not separate them, so:
+    //   digit [11:8] = sticky cause bitmask, latched per second
+    //        bit3 hold_play (seek-hold)   bit2 !ld_playing
+    //        bit1 on_leader               bit0 !header_valid
+    //   digits [7:0] = ring level >> 4 (coarse 00-FF; FF would be full)
+    // Reading "8nn" => the seek-hold is muting audio. "4nn" => ld_playing dropping.
+    // "0nn" with C spiking => neither: the loss is ring-empty or credit, not muting.
+    reg  [3:0]  dbg_cause_acc, dbg_cause_q;
+    wire [3:0]  dbg_cause_now = {hold_play, !ld_playing, on_leader, !header_valid};
+    always @(posedge clk) begin
+        if (reset) begin
+            dbg_cause_acc <= 4'd0;  dbg_cause_q <= 4'd0;
+        end else if (dbg_sec >= (ACC_MOD - 28'd1)) begin
+            dbg_cause_q   <= dbg_cause_acc;   // latch the completed second
+            dbg_cause_acc <= 4'd0;
+        end else begin
+            dbg_cause_acc <= dbg_cause_acc | dbg_cause_now;
+        end
+    end
+    // AUD_AW went 12 -> 14, so aud_level is 14 bits now. This was still slicing
+    // [11:4] and silently dropping the top TWO bits -- the level half wrapped and
+    // was meaningless (a real level of 15871 displayed as 0x3F). Slice from the top
+    // instead so the byte is always "fraction of the ring, full scale = FF",
+    // whatever AUD_AW is.
+    // ORIGINAL: assign dbg_aud_level = {dbg_cause_q, aud_level[11:4]};
+    assign dbg_aud_level = {dbg_cause_q, aud_level[AUD_AW-1 -: 8]};
+
+    // ⛔ REVISED AGAIN 2026-08-15. The previous "credit-blocked ticks" counter had a
+    // BLIND SPOT: it required !aud_muted, so it reads 000 both when credit never
+    // blocks AND when we are muted so often we rarely try to drain. It cannot tell
+    // those apart, and 000 was overread as "credit is fine".
+    //
+    // This counts the OUTCOME instead -- samples that actually reach the DAC. The
+    // drain must average exactly 44,100/s for audio to be real-time, whatever the
+    // mechanism. So: samples SHORT of 44,100 in the last second.
+    //     000  audio is exactly real-time  -> any sync error is a fixed OFFSET
+    //     nnn  audio is running slow by nnn samples/s -> DRIFT, and nnn is the rate
+    //          (00F = the ~15/s credit deficit; larger = mute/underrun stalls)
+    // Saturates FFF. Negative (running fast) clamps to 000 -- not expected, the
+    // drain cannot exceed samp_tick.
+    reg [27:0] dbg_sec;          // 40 MHz second
+    reg [16:0] dbg_drained;      // samples actually drained this second
+    always @(posedge clk) begin
+        if (reset) begin
+            dbg_sec <= 28'd0;  dbg_drained <= 17'd0;  dbg_credit_rate <= 12'd0;
+        end else if (dbg_sec >= (ACC_MOD - 28'd1)) begin
+            dbg_sec     <= 26'd0;
+            dbg_credit_rate <= (dbg_drained >= 17'd22050) ? 12'd0 :
+                               ((17'd22050 - dbg_drained) > 17'd4095) ? 12'hFFF :
+                               (17'd22050 - dbg_drained);
+            dbg_drained <= 17'd0;
+        end else begin
+            dbg_sec <= dbg_sec + 28'd1;
+            if (aud_drain && (dbg_drained != 17'h1FFFF)) dbg_drained <= dbg_drained + 17'd1;
         end
     end
 

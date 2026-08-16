@@ -280,23 +280,16 @@ set_location_assignment PIN_AG23 -to BTN_RESET
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to LED_*
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to BTN_*
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to BTN_*
+# QSF-CLEANUP-2026-08-15: `source files.qip` (above) is the ONE live file list.
+# Everything that used to follow it here was dead fork residue inherited from the
+# Kangaroo core -- Arcade-Kangaroo.sv, rtl/Kangaroo{,_CPU,_SND}.sv, rtl/hiscore.v
+# and rtl/cpu/mb88.vhd never existed in this tree (nor in DragonsLair's, which
+# built fine regardless), plus duplicates of entries files.qip already provides.
+# It had to go now rather than later: T80.qip, v_sound.qip and rtl/nvram.v were
+# real until the STRIP above deleted them, so those three lines became dangling
+# references to missing files. Add new sources to files.qip, never here.
 source files.qip
-set_global_assignment -name VERILOG_FILE rtl/nvram.v
 set_global_assignment -name VHDL_INPUT_VERSION VHDL_2008
-set_global_assignment -name SYSTEMVERILOG_FILE "Arcade-Kangaroo.sv"
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/Kangaroo.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/Kangaroo_CPU.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/Kangaroo_SND.sv
-set_global_assignment -name QIP_FILE rtl/cpu/T80/T80.qip
-set_global_assignment -name QIP_FILE rtl/sound/v_sound.qip
-set_global_assignment -name VERILOG_FILE rtl/pause.v
-set_global_assignment -name VERILOG_FILE rtl/hiscore.v
-set_global_assignment -name VHDL_FILE rtl/cpu/mb88.vhd
-set_global_assignment -name VHDL_FILE rtl/ram_rom/dpram_dc.vhd
-set_global_assignment -name VHDL_FILE rtl/ram_rom/spram.vhd
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/ram_rom/rom_loader.sv
-set_global_assignment -name VERILOG_FILE rtl/pll.v
-set_global_assignment -name VERILOG_FILE rtl/pll/pll_0002.v
 
 
 

@@ -195,24 +195,31 @@ assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
-wire signed [15:0] audio_l, audio_r;
-// STREAMING-2026-07-04: mux .dlv PCM (pcm_l/pcm_r from dlv_streamer, declared near the streamer) with
-// the AY, saturating.  pcm_* forward-referenced (same as pause_cpu below); driven by dlv_strm.
-wire signed [16:0] mix_l = audio_l + pcm_l;
-wire signed [16:0] mix_r = audio_r + pcm_r;
-wire signed [15:0] sat_l = (mix_l >  17'sd32767) ?  16'sd32767 :
-                           (mix_l < -17'sd32768) ? -16'sd32768 : mix_l[15:0];
-wire signed [15:0] sat_r = (mix_r >  17'sd32767) ?  16'sd32767 :
-                           (mix_r < -17'sd32768) ? -16'sd32768 : mix_r[15:0];
-assign AUDIO_L = pause_cpu ? 16'd0 : sat_l;
-assign AUDIO_R = pause_cpu ? 16'd0 : sat_r;
+// STRIP-2026-08-15: ALL audio is now the .dlv tape audio.  Dragon's Lair mixed the
+// AY-3-8910 (audio_l/r, from DragonsLair_CPU) with the .dlv PCM; Robots has no sound
+// chip, so audio_l/r would be a constant 0 and the mux + saturation collapse to a
+// straight pass-through of pcm_l/pcm_r.  Removing them rather than tying them to 0
+// keeps a 17-bit adder and two comparators out of the fabric for no behaviour change.
+//
+// ORIGINAL (restore verbatim if a synthesised sound source is ever added):
+// wire signed [15:0] audio_l, audio_r;
+// wire signed [16:0] mix_l = audio_l + pcm_l;
+// wire signed [16:0] mix_r = audio_r + pcm_r;
+// wire signed [15:0] sat_l = (mix_l >  17'sd32767) ?  16'sd32767 :
+//                            (mix_l < -17'sd32768) ? -16'sd32768 : mix_l[15:0];
+// wire signed [15:0] sat_r = (mix_r >  17'sd32767) ?  16'sd32767 :
+//                            (mix_r < -17'sd32768) ? -16'sd32768 : mix_r[15:0];
+// assign AUDIO_L = pause_cpu ? 16'd0 : sat_l;
+// assign AUDIO_R = pause_cpu ? 16'd0 : sat_r;
+assign AUDIO_L = pause_cpu ? 16'd0 : pcm_l;   // pcm_* driven by dlv_strm, declared near the streamer
+assign AUDIO_R = pause_cpu ? 16'd0 : pcm_r;
 assign AUDIO_S = 1;   // signed
 assign AUDIO_MIX = 0; // no mix, true stereo
 
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
 wire dbg_led;
-assign LED_USER  = dbg_led;  // ~0.6 Hz "core alive" heartbeat from DragonsLair_CPU
+assign LED_USER  = dbg_led;  // ~0.6 Hz "core alive" heartbeat from rtl/Robots.sv
 assign BUTTONS = 0;
 
 ///////////////////////////////////////////////////
@@ -243,8 +250,8 @@ assign VIDEO_ARY = horz ? ((!ar) ? 12'd500 : 12'd0) : ((!ar) ? 12'd4 : 12'd0);  
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"DRAGONSLAIR;;",
-	"S0,DLV,Load Disc;",   // LD-VIDEO-2026-07-04: mount slot 0 for the .dlv (name-match auto-mount: dlair.dlv/spaceace.dlv)
+	"ROBOTS;;",
+	"S0,DLV,Load Tape;",   // slot 0 mounts robots.dlv (name-match auto-mount: robots.dlv)
 	"ODE,Aspect Ratio,Original,Full screen,[ARC1],[ARC2];",
 	// "OC,Orientation,Vert,Horz;",  // ROT0-FIX-2026-07-03: removed — DL/SA horizontal-only, orientation hardcoded (see horz)
 	"OB,Flip Vertical,Off,On;",
@@ -344,7 +351,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 ////////////////////   CLOCKS   ///////////////////
 wire CLK_40M;
-wire CLK_10M;
+wire CLK_UNUSED_10M;   // PLL outclk_1, consumed by nothing since CLOCK-UNIFY-2026-07-04
 wire locked;
 
 pll pll
@@ -352,7 +359,7 @@ pll pll
     .refclk(CLK_50M),
     .rst(0),
     .outclk_0(CLK_40M),
-    .outclk_1(CLK_10M),
+    .outclk_1(CLK_UNUSED_10M),
     .locked(locked)
 );
 
@@ -422,7 +429,14 @@ wire m_start1   = btn_1p_start  | joystick_0[9];
 wire m_start2   = btn_2p_start  | joystick_0[10];
 wire m_coin1    = btn_coin1     | joystick_0[8];
 wire m_coin2    = btn_coin2     | joystick_1[8];
-wire m_pause    = btn_pause     | joystick_0[11];
+// SEEK-BUTTONS-2026-08-15: L and R become index seek, so L must come OFF the
+// MiSTer system pause or the two fight over joystick_0[11]. System pause remains
+// on the keyboard 'P' and the OSD; the TAPE pause is Start, which is the one a
+// player actually wants.
+// ORIGINAL: wire m_pause = btn_pause | joystick_0[11];
+wire m_pause    = btn_pause;
+wire m_seek_prev = joystick_0[11];   // L
+wire m_seek_next = joystick_0[10];   // R
 
 // PAUSE SYSTEM
 wire pause_cpu;
@@ -433,7 +447,7 @@ wire [23:0] rgb_out;
 // below) -- the dim-after-10s-paused feature has been non-functional since the FB-PIVOT-
 // 2026-07-04 rewiring, predating this session. Left as-is (pre-existing, separate gap) rather
 // than silently also wiring it in -- that's a real display-behavior change, not a compile fix.
-pause #(8,8,8,10) pause
+pause #(8,8,8,CORE_CLK_HZ/1000000) pause  // CLKSPD in MHz; was hardcoded 10 while the clock was 40
 (
 	.*,
 	.clk_sys(CLK_40M),   // CLOCK-UNIFY-2026-07-04: was CLK_10M
@@ -540,42 +554,63 @@ wire       fb_seek_edge = fb_seek_pulse & ~fb_seek_q;   // if the source ever st
 wire       fb_aud_primed;      // from dlv_streamer (ring >= SEEK_FILL)
 reg        fb_seek_hold;       // driven in the framebuffer block below
 
-wire        ld_playing_top;      // AUDIO-GATE-2026-07-05: LD mode==PLAY from DragonsLair -> dlv_streamer
+wire        ld_playing_top;      // AUDIO-GATE-2026-07-05: tape is rolling -> dlv_streamer audio gate
 
-//Instantiate Dragon's Lair top-level game module
-DragonsLair dl_inst
+// UI-SEAM-2026-08-15: modal state out of Robots.sv, awaiting the overlay renderer.
+/* verilator lint_off UNUSED */
+wire        ui_modal_w;          // 1 = draw a modal over the video window
+wire        ui_confirm_sel_w;    // 0 = "No" highlighted, 1 = "Yes"
+wire        card_show_w;         // 1 = paint clue card full-screen over the video
+wire  [2:0] card_id_w;           // 0..5 = card A..F
+wire  [5:0] cards_revealed_w;    // sticky reveal mask for the thumbnail strip
+/* verilator lint_on UNUSED */
+
+// STRIP-2026-08-15: `DragonsLair dl_inst` (Z80 + AY-3-8910 + LD-V1000 HLE) replaced by the
+// Robots tape transport. Same five-signal seam, so nothing below this point changed.
+// Ports that went with the arcade hardware: .dsw (DIP switches read through the AY -- no AY,
+// and difficulty is a boot-time menu choice here, not a DIP), .sound_l/.sound_r (no sound
+// chip; ALL audio is the .dlv tape audio, see AUDIO_L/R above), and .ioctl_* (no ROMs to
+// load -- the only payload is robots.dlv, which arrives over the sd_*/img_* block interface
+// on hps_io slot 0, not the ioctl ROM path).
+//
+// Controls follow README.MD. Verified against the joystick bits at lines 413-432 rather than
+// assumed: Start is joystick_0[9] -> m_start1 -> cab[0], which does NOT collide with the
+// MiSTer system pause on joystick_0[11] (m_pause -> pause_cpu). Those are two different
+// pauses and both are wired: Start holds the TAPE, the OSD/P pause freezes the whole core.
+Robots #(.CLK_HZ(CORE_CLK_HZ)) robots_inst
 (
 	.reset(~reset),       // MiSTer reset is active-high; invert for active-low game modules
 
-	.clk_sys(CLK_40M),   // 40 MHz: Z80=/10=4MHz, AY=/20=2MHz, pixel=/8=5MHz (real-hardware speed)
+	.clk_sys(CLK_40M),    // 40 MHz -- film cadence divider lives inside Robots.sv
 
-	// P1 (0xC008): {3'b0, action, right, left, down, up} active-high (inverted to active-low bus inside)
-	// SKILL-BUTTONS-2026-07-25: original was `{3'b000, m_action1, ...}` -- bits 7:5 tied off, so
-	// Space Ace's Cadet/Captain/Space Ace buttons could never be pressed. Restore to revert.
-	.p1({m_skill3, m_skill2, m_skill1, m_action1, m_right1, m_left1, m_down1, m_up1}),
-	// SYSTEM (0xC010) cabinet bits: {coin2, coin1, start2, start1} active-high
+	// { R, L, B, A, right, left, down, up } active-high.
+	// A = joystick_0[4] (select/activate), B = joystick_0[5] (return/revert),
+	// L = joystick_0[11] (seek prior index), R = joystick_0[10] (seek next index).
+	.p1({m_seek_next, m_seek_prev, m_skill1, m_action1, m_right1, m_left1, m_down1, m_up1}),
+	// { coin2, coin1, start2, start1 } -- cab[0] = Start = play/pause,
+	// cab[2] = m_coin1 = the pad's Select button (reserved for difficulty).
 	.cab({m_coin2, m_coin1, m_start2, m_start1}),
-	// dsw[7:0] = DSW1 (AY port A), dsw[15:8] = DSW2 (AY port B)
-	.dsw(dsw),
-
-	.sound_l(audio_l),
-	.sound_r(audio_r),
-
-	.ioctl_addr(ioctl_addr),
-	.ioctl_data(ioctl_dout),
-	.ioctl_wr(ioctl_wr),
-	.ioctl_index(ioctl_index),
 
 	.pause(pause_cpu),
-	// LD-HOLD-SYNC-2026-08-13: the seek hold now freezes the DISC as well as the picture, so the
-	// game cannot execute frames it has not shown yet. fb_seek_hold is already in this CLK_40M
-	// domain (SEEK_TMO is counted at 40 MHz), so no CDC is needed.
+	// LD-HOLD-SYNC-2026-08-13: the seek hold freezes the frame counter as well as the picture.
+	// fb_seek_hold is already in this CLK_40M domain, so no CDC is needed.
 	.disc_hold(fb_seek_hold),
 
 	.led_digits_o(led_digits_flat),
 	.dbg_led(dbg_led),
-	.ld_frame_o(ld_curr_frame_top), .ld_search_cmd_o(fb_seek_pulse),   // HLE-DRIVE / SEEK-HOLD-2026-07-20
-	.ld_playing_o(ld_playing_top)     // AUDIO-GATE-2026-07-05
+	.ld_frame_o(ld_curr_frame_top), .ld_search_cmd_o(fb_seek_pulse),
+	.ld_playing_o(ld_playing_top),
+
+	// UI-SEAM-2026-08-15: consumed by the overlay renderer once the clue-panel
+	// framebuffer exists. Connected (not left dangling) so the seam is explicit
+	// and the signals are already named where the renderer will need them.
+	// Until then the modal state is visible on the LED band's debug digit 15.
+	.ui_modal_o(ui_modal_w), .ui_confirm_sel_o(ui_confirm_sel_w),
+	// INDEX-2026-08-15: clue-card state for the (not yet built) overlay renderer.
+	// card_show_w is high across the whole Clue Card segment while the tape keeps
+	// rolling, so the renderer paints the card over the video window and the
+	// on-tape audio sting plays underneath.
+	.card_show_o(card_show_w), .card_id_o(card_id_w), .cards_revealed_o(cards_revealed_w)
 );
 
 // HISCORE REMOVED 2026-07-04 — Dragon's Lair / Space Ace / Thayer's Quest do not
@@ -637,7 +672,9 @@ wire signed [15:0] pcm_l, pcm_r;        // STREAMING-2026-07-04: .dlv PCM -> aud
 // STREAMING-2026-07-04: continuous video+audio streamer.  Free-runs film frames from START_FRAME
 // (paced ~30 fps), and keeps a 44.1 kHz PCM ring topped up (audio has SD priority).  The one-shot
 // frame fetch (ld_req_*/STAGE1_FRAME) is removed — this is the real streaming path.
-dlv_streamer #(.START_FRAME(17'd1000)) dlv_strm (
+// ROBOTS-RATE-2026-08-15: START_FRAME 1000 -> 0. DL used 1000 to skip its black leader;
+// robots.dlv was packed with ldframe_offset=0 and disc==video 1:1, so frame 0 is real content.
+dlv_streamer #(.CLK_HZ(CORE_CLK_HZ), .START_FRAME(17'd0)) dlv_strm (
     .clk(CLK_40M), .reset(reset),
     .img_mounted(dlv_img_mounted), .img_size(dlv_img_size),
     .sd_lba(dlv_sd_lba[0]), .sd_blk_cnt(dlv_sd_blk_cnt[0]),
@@ -648,8 +685,25 @@ dlv_streamer #(.START_FRAME(17'd1000)) dlv_strm (
     .pcm_l(pcm_l), .pcm_r(pcm_r),
     .ld_curr_frame(ld_curr_frame_top), .pause(pause_cpu),   // HLE-DRIVE-2026-07-04
     .aud_primed(fb_aud_primed), .hold_play(fb_seek_hold), .seek_flush(fb_seek_pulse),   // SEEK-HOLD/FLUSH-2026-07-20
-    .ld_playing(ld_playing_top)                             // AUDIO-GATE-2026-07-05
+    .ld_playing(ld_playing_top),                            // AUDIO-GATE-2026-07-05
+    .dbg_aud_level(dbg_aud_level), .dbg_credit_rate(dbg_credit_rate)  // DIAG-REVERT-2026-08-15
 );
+
+// DIAG-REVERT-2026-08-15: A/V-sync discriminator on the LED band's 6 free adjacent
+// slots (digits 8-13 = led_band slots 17-22, the old "P2 score" group).
+//   left  3 digits "L" = LIVE audio ring level 000-FFF (ring holds 93 ms)
+//                        high => fill keeps up, CREDIT is the limiter (audio slow)
+//                        low  => FILL is the limiter, i.e. SD bandwidth
+//   right 3 digits "C" = credit-blocked ticks in the LAST SECOND (saturates FFF)
+// Rebuilt 2026-08-15: the previous saturating TOTALS pegged at EEE within
+// seconds and discriminated nothing. A level and a rate do.
+// Nibbles are reversed per group because digit 8 is the LEFTMOST slot, so the
+// most-significant nibble has to sit in the LOWEST digit index to read naturally.
+wire [11:0] dbg_aud_level, dbg_credit_rate;
+wire [63:0] led_digits_dbg = { led_digits_flat[63:56],                 // 15,14 from Robots.sv
+                               led_digits_flat[55:44],                                  // 13-11 packet+seed
+                               dbg_aud_level[3:0],   dbg_aud_level[7:4],   dbg_aud_level[11:8],
+                               led_digits_flat[31:0] };                // 7..0 from Robots.sv
 
 // ---- JPEG frame decoder: byte stream -> px writes (block-order, addressed by x,y) ----
 wire        dec_px_we, dec_px_ready;
@@ -729,9 +783,10 @@ reg        fb_have_new;    // a completed frame is waiting for the next vblank
 
 // ---- SEEK-HOLD-2026-07-20 state (see the note above the dlv_streamer instance) ---------------
 localparam [2:0]  SEEK_PRIME = 3'd3;          // post-seek frames to bank before resuming
-localparam [25:0] SEEK_TMO   = 26'd40000000;  // ~1 s @40 MHz -- SAFETY, see below
+localparam [31:0] CORE_CLK_HZ = 32'd100_000_000;   // CLK-PARAM-2026-08-15: single source
+localparam [27:0] SEEK_TMO   = CORE_CLK_HZ[27:0];  // ~1 s at any clock  // ~1 s @40 MHz -- SAFETY, see below
 reg  [2:0]  fb_prime_cnt;
-reg  [25:0] fb_seek_tmr;
+reg  [27:0]  fb_seek_tmr;
 reg         fb_wr_stale;   // frame decoding when the seek hit -> finish it, but never publish it
 // ⚠️ SAFETY TIMEOUT IS NON-NEGOTIABLE. An unbounded "wait until buffers fill" is a brand-new
 // hard-lock source -- exactly the class of bug removed from this core (fill_idle/ddram). The
@@ -761,7 +816,7 @@ always @(posedge CLK_40M) begin
         fb_seek_q    <= 1'b0;
         fb_seek_hold <= 1'b0;      // SEEK-HOLD-2026-07-20
         fb_prime_cnt <= 3'd0;
-        fb_seek_tmr  <= 26'd0;
+        fb_seek_tmr  <= 28'd0;
         fb_wr_stale  <= 1'b0;
     end else begin
         fb_seek_q <= fb_seek_pulse;   // SEEK-HOLD-2026-07-20
@@ -786,7 +841,7 @@ always @(posedge CLK_40M) begin
         end
         // SEEK-HOLD: run the safety timer and release once primed (or on timeout)
         if (fb_seek_hold) begin
-            if (fb_seek_tmr < SEEK_TMO) fb_seek_tmr <= fb_seek_tmr + 26'd1;
+            if (fb_seek_tmr < SEEK_TMO) fb_seek_tmr <= fb_seek_tmr + 28'd1;
             if (fb_seek_release)        fb_seek_hold <= 1'b0;
         end
         // SEEK-HOLD: arm. LAST so it wins any coincidence -- a frame completing on the same cycle
@@ -816,7 +871,7 @@ always @(posedge CLK_40M) begin
             fb_wr_stale  <= ~dec_idle | dec_reset_w;   // tag anything IN FLIGHT: fetching or decoding
             fb_seek_hold <= 1'b1;
             fb_prime_cnt <= 3'd0;
-            if (!fb_seek_hold) fb_seek_tmr <= 26'd0;
+            if (!fb_seek_hold) fb_seek_tmr <= 28'd0;
         end
     end
 end
@@ -893,7 +948,13 @@ fb_raster_reader #(
     // purely the per-LINE deadline.
     // clk/4 -> 576*4 = 2304 cyc/line = 18 cycles per request, and 33.4 Hz is still above the
     // 23.938 fps content rate. Also halves DDR read traffic (5.57 M/s -> 3.52 M/s).
-    .CE_DIV_LOG2(3'd2),
+    // CLK-100M-BOUNCE-2026-08-15: 2 -> 3. Holding 29.97 Hz at 100 MHz with CE=2
+    // needed V_TOTAL 1448 for a 512-line image -- 65% vertical blanking, a mode the
+    // scaler struggles to lock, which shows up as the picture BOUNCING. Dividing the
+    // pixel clock instead restores a normal shape: V_TOTAL 724, i.e. essentially
+    // DL's HW-proven 725. Also gives the DDR MORE cycles per line (4608 vs 2304),
+    // on top of the 2.5x faster memory clock.
+    .CE_DIV_LOG2(3'd3),
 
     // ---- CADENCE-FIX-2026-07-24 ------------------------------------------------------------
     // SYMPTOM this addresses (user, on Space Ace): "the graphics are very jumpy" -- specifically
@@ -929,7 +990,29 @@ fb_raster_reader #(
     // ⚠️ ALSO CHECK DRAGON'S LAIR IN THE SAME BUILD: DL and TQ share the 23.938 film tick, so they
     // were juddering too. If DL looked SMOOTH before this change, the analysis above is WRONG.
     // ORIGINAL: V_BP defaulted to 16'd16 (V_TOTAL 528 -> 32.881 Hz). Delete this line to revert.
-    .V_BP       (16'd213)
+    // ROBOTS-RATE-2026-08-15: retuned for 29.97 fps content. The whole CADENCE-FIX above exists
+    // to land ONE refresh per film frame, and 213 was solved for DL's 23.938 fps. Robots runs
+    // 29.97, so leaving 213 would present 29.97 fps of content on a 23.95 Hz display -- roughly
+    // 6 frames a second never shown, i.e. exactly the lurch the fix was written to remove.
+    //   V_TOTAL = 40e6 / (4 * 576 * 29.97) = 579.3  ->  579
+    //   V_BP    = 579 - (500 + 8 + 4) = 67
+    //   refresh = 40e6 / (4*576*579) = 29.9847 Hz  vs  film 29.97003  ->  ratio 1.00049,
+    //   so the phase slips one refresh about every 2,040 frames (~68 s): one micro-hitch a
+    //   minute, the same trade DL accepted at 1.00035. 579 is the best integer available at
+    //   CE_DIV_LOG2=2 / H_TOTAL=576; the exact match would need V_TOTAL 579.28.
+    // BONUS: this also retires the "~23.9 Hz is unusually low for the MiSTer video chain" risk
+    // flagged above -- 29.98 Hz is an ordinary refresh, so it is LESS likely to upset the scaler
+    // than the value it replaces, not more.
+    // ORIGINAL (Dragon's Lair, 23.938 fps content -> 23.9464 Hz): .V_BP (16'd213)
+    // CLK-100M-2026-08-15: 100 MHz core (PLL: 800 MHz VCO / C0=8; the COUNTERS are
+    //   the real config, the output_clock_frequency strings are only metadata).
+    //   pixel = CLK/8 = 12.5 MHz, H_TOTAL = 576
+    //   V_TOTAL = 12.5e6 / 29.97003 / 576 = 724.1  ->  724
+    //   V_BP    = 724 - (500 + 8 + 4) = 212
+    //   refresh = 12.5e6/(576*724) = 29.9749 Hz vs film 29.97003 -> ratio 1.00016,
+    //   the best yet (40 MHz build was 1.00049) and still on the fast side.
+    // ORIGINAL (40 MHz core): .V_BP (16'd67)   ·   DL's proven shape was V_TOTAL 725.
+    .V_BP       (16'd212)
 ) rr (
     .clk(CLK_40M), .reset(reset),
     .frame_base_hw(fb_rd_base),             // FB-DOUBLEBUF-2026-07-15: was hardcoded 27'd0, see fb_buf_sel above
@@ -946,7 +1029,9 @@ fb_raster_reader #(
 //   X_START = (512 - 33*6*2)/2 = 58.  ORIGINAL: led_band led_band_i (
 led_band #(.X_START(16'd58), .SCALE_LOG2(2'd1)) led_band_i (
     .hc(rr_hpos), .vc(rr_vpos),
-    .led_digits(led_digits_flat),   // real score/lives, restored 2026-07-15
+    // DIAG-REVERT-2026-08-15: original below, uncomment to restore
+    // .led_digits(led_digits_flat),   // real score/lives, restored 2026-07-15
+    .led_digits(led_digits_dbg),    // DIAG: A/V-sync counters in digits 8-13
     .seg_lit(led_lit)
 );
 

@@ -151,7 +151,14 @@ from multiprocessing import Pool, cpu_count
 
 SECTOR    = 512
 DISC_FPKS = 29970          # NTSC, fixed for all these games
-SRATE     = 44100
+# AUDIO-RATE-2026-08-15: was a hard constant. Robots is bandwidth-limited (~1.5x
+# DL's proven envelope), and halving the rate both cuts the audio load and DOUBLES
+# the streamer's ring TIME for free, since the ring holds a fixed sample COUNT.
+# Measured on this transfer: 92-96%% of energy sits below 11 kHz, so 22050 discards
+# mostly VHS hiss. Written to the header @32 and folded into samp_per_frame_q16,
+# so the .dlv stays self-describing -- but dlv_streamer.v's ACC_INC and
+# SAMP_PER_TICK are NOT header-driven and MUST be changed to match.
+SRATE     = 44100          # overridden by --srate
 CHANS     = 2
 MAGIC     = b"DLV1"
 VER       = 2
@@ -459,6 +466,9 @@ def main():
     ap.add_argument("--size", default="512x480",
                     help="output geometry. DEFAULT IS NOW 512x480 = the native Daphne\n                          m2v size, i.e. NO resampling at all. 512 is also exactly\n                          fb_raster_reader's line-buffer ceiling.")
     ap.add_argument("-q", "--quality", type=int, default=3, help="2..31, lower=better")
+    ap.add_argument("--srate", type=int, default=44100,
+                    help="audio sample rate in the .dlv (default 44100). "
+                         "MUST match dlv_streamer.v ACC_INC and SAMP_PER_TICK.")
     ap.add_argument("--fbuf-aw", type=int, default=17, help="dlv_streamer.v FBUF_AW")
     ap.add_argument("--deint", action="store_true")
     ap.add_argument("--reuse", action="store_true")
@@ -466,6 +476,11 @@ def main():
     ap.add_argument("--keep", action="store_true",
                     help="keep the .mjpeg/.pcm/.idx intermediates instead of deleting them")
     a = ap.parse_args()
+
+    # AUDIO-RATE-2026-08-15: apply --srate before anything derives from it
+    # (samp_per_frame_q16, the ffmpeg -ar, the header @32 field).
+    global SRATE
+    SRATE = a.srate
 
     W, H = (int(v) for v in a.size.lower().split("x"))
     fbuf_bytes = 1 << a.fbuf_aw
@@ -499,7 +514,10 @@ def main():
     # Everything the framefile names is resolved inside --src. Audio is matched to each segment's
     # m2v first (Daphne's own convention, lair.m2v -> lair.ogg) and falls back to the game name,
     # since our tree ships dlair.ogg alongside lair.m2v.
-    AUD_EXT = (".ogg", ".wav", ".flac", ".m4a", ".mp3")
+    # AUDIO-FROM-DV-2026-08-15: ".dv" last. Type-1 DV carries audio inside the video
+    # frames, so ffmpeg can pull it straight out and the 519 MB intermediate .wav
+    # (a derived file the design note says to delete freely) never has to exist.
+    AUD_EXT = (".ogg", ".wav", ".flac", ".m4a", ".mp3", ".dv")
 
     def find_src(fname):
         p = os.path.join(src, fname)

@@ -1,0 +1,56 @@
+<misterromdescription>
+    <name>Isaac Asimov's Robots</name>
+    <region>US</region>
+    <homebrew>no</homebrew>
+    <bootleg>no</bootleg>
+    <version></version>
+    <alternative></alternative>
+    <platform>VCR</platform>
+    <series></series>
+    <year>1988</year>
+    <manufacturer>Eastman Kodak</manufacturer>
+    <category>VCR</category>
+
+    <setname>robots</setname>
+    <parent></parent>
+    <mameversion></mameversion>
+    <rbf>Robots</rbf>
+    <about>Kodak VCR Game KV-701VT. A Seth Godin Production. Licensed from Isaac Asimov's Robot novels (Doubleday).</about>
+
+    <resolution>15kHz</resolution>
+    <rotation>horizontal</rotation>
+    <flip>no</flip>
+
+    <players>1</players>
+    <joystick>4-way</joystick>
+    <special_controls></special_controls>
+    <num_buttons>2</num_buttons>
+    <!-- Positional: name i maps to joystick bit 4+i, so the order is fixed by the core.
+           b4=A  b5=B  b6=X  b7=Y  b8=Select  b9=Start  b10=R  b11=L
+         Start is the TAPE transport (play/pause), NOT the MiSTer system pause.
+         Select opens a Restart? Yes/No prompt; A confirms, B cancels. -->
+    <buttons names="Select/Activate,Return/Back,Not Used,Not Used,Restart Game,Play/Pause,Seek Next Index,Seek Prior Index"
+             default="A,B,X,Y,Select,Start,R,L"/>
+
+    <!-- NO rom SECTION, AND NO switches, DELIBERATELY.
+
+         This title has no arcade PCB and therefore no ROMs: there is no CPU, no
+         sound chip and no program code to load. The core's entire payload is the
+         user-built robots.dlv (video + audio), which arrives over the hps_io
+         block/disk interface on slot 0 (the "Load Tape" entry in the OSD), and
+         NOT over the ioctl ROM path that a rom index entry would drive.
+
+         Difficulty is likewise not a DIP. It selects which 64 entry solution
+         table and which 12 clue card bitmaps are live, so it is a boot time
+         choice made inside the core before the tape rolls, not a switch read
+         from an MRA assembled ROM.
+
+         setname "robots" is what makes the tape mount without a trip through the
+         OSD: the same name match auto mount Dragon's Lair uses for dlair.dlv and
+         spaceace.dlv, so this looks for robots.dlv. If a given MiSTer build does
+         not auto mount it, the OSD "Load Tape" entry mounts it by hand and always
+         works. -->
+
+    <remark>Requires robots.dlv, built from your own tape with releases/scripts/robots_dlv.py. No ROM zip is needed or used.</remark>
+    <mratimestamp>20260815000000</mratimestamp>
+</misterromdescription>

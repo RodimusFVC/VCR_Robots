@@ -1,16 +1,17 @@
 set_global_assignment -name VHDL_INPUT_VERSION VHDL_2008
 
-set_global_assignment -name SYSTEMVERILOG_FILE Arcade-DragonsLair.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/DragonsLair.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/DragonsLair_CPU.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/DragonsLair_LDV1000.sv
+set_global_assignment -name SYSTEMVERILOG_FILE VCR-Robots.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Robots.sv
 
-set_global_assignment -name QIP_FILE rtl/cpu/T80/T80.qip
-
-set_global_assignment -name QIP_FILE rtl/sound/v_sound.qip
+# STRIP-2026-08-15: the Dragon's Lair control layer was removed, not renamed.
+# Robots has no arcade PCB -- no Z80, no AY-3-8910, no LD-V1000, no NVRAM -- so
+# rtl/DragonsLair{,_CPU,_LDV1000}.sv, rtl/cpu/T80/, rtl/sound/ (jt49+Filters) and
+# rtl/nvram.v were deleted along with their assignments here.  What the fork was
+# FOR is everything under rtl/video/ below, plus ddram/pll/sys.  rtl/Robots.sv
+# replaces the deleted control layer on the same 5-signal seam
+# (ld_frame_o / ld_search_cmd_o / ld_playing_o / led_digits_o / dbg_led).
 
 set_global_assignment -name VERILOG_FILE rtl/pause.v
-set_global_assignment -name VERILOG_FILE rtl/nvram.v
 
 set_global_assignment -name VHDL_FILE rtl/ram_rom/dpram_dc.vhd
 set_global_assignment -name VHDL_FILE rtl/ram_rom/spram.vhd
@@ -49,4 +50,4 @@ set_global_assignment -name VERILOG_FILE rtl/video/core_jpeg/src_v/jpeg_idct_tra
 set_global_assignment -name VERILOG_FILE rtl/video/core_jpeg/src_v/jpeg_output.v
 set_global_assignment -name VERILOG_FILE rtl/video/core_jpeg/src_v/jpeg_output_fifo.v
 set_global_assignment -name VERILOG_FILE rtl/video/core_jpeg/src_v/jpeg_output_y_ram.v
-set_global_assignment -name VERILOG_FILE rtl/video/core_jpeg/src_v/jpeg_output_cx_ram.v
+set_global_assignment -name VERILOG_FILE rtl/video/core_jpeg/src_v/jpeg_output_cx_ram.v

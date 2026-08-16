@@ -1,15 +1,29 @@
 //============================================================================
-// led_band.v — Dragon's Lair LED score/status band at framebuffer (x,y) coords
+// led_band.v — VCR-Robots status band at framebuffer (x,y) coords
 //----------------------------------------------------------------------------
-// Ported from the raster renderer in DragonsLair_CPU.sv so the band can be
-// composited over the 320-wide video (that renderer used the 256-wide core
-// raster).  Given the current pixel (hc,vc) + the 16 LED digits, outputs
-// seg_lit = this pixel is a lit segment of the band.  The caller paints it red.
+// Originally Dragon's Lair's arcade scoreboard, ported from the raster renderer
+// in DragonsLair_CPU.sv.  Given the current pixel (hc,vc) + the 16 LED digits,
+// outputs seg_lit = this pixel is a lit segment of the band.  Caller paints it.
 //
 // Layout: 33 char-slots x 6px pitch, 5x7 glyphs, band rows BAND_Y0..+7.
 // X_START recentred for 320: (320 - 33*6)/2 = 61.
-// Digit map (led_digits[i*4 +: 4]): 0-5 P1 score, 6 P1 lives, 7 P2 lives,
-// 8-13 P2 score, 14-15 credits.  (matches MAME dlair.lay / DragonsLair_CPU)
+//
+// ROBOTS-2026-08-15 — RELABELLED.  The band used to read
+//     "P1 <score> L <lives>   P2 <score> L <lives>   CR <credits>"
+// which is meaningless here: Robots keeps no score, no lives and no credits, so
+// every label described something the digits underneath were not.  It now reads
+//
+//     F012345 S07 L7A3 C00F P1 M0
+//
+// Digit map (led_digits[i*4 +: 4]):
+//   0-5   frame number, decimal, MSD first      -> "F"
+//   6-7   current segment index, DECIMAL 00-21   -> "S"
+//   8-10  DIAG live audio ring level, hex       -> "L"   ] DIAG-REVERT-2026-08-15
+//   11-13 DIAG credit-blocks per second, hex    -> "C"   ] remove with the A/V work
+//   14    1 = tape rolling, 0 = paused          -> "P"
+//   15    modal: 0 none / 1 Restart?No / 2 Yes  -> "M"
+//
+// Font holds 0-9 A-F plus P L R S M.  Code 31 is blank; code 15 is a real 'F'.
 //============================================================================
 module led_band #(
     // RES-512x480-FIX-2026-07-24: X_START must be recentred for the new width, and the glyphs
@@ -47,10 +61,20 @@ module led_band #(
             5'd12: glyph = 35'b01110_10001_10000_10000_10000_10001_01110; // C
             5'd13: glyph = 35'b11110_10001_10001_10001_10001_10001_11110; // D
             5'd14: glyph = 35'b11111_10000_10000_11110_10000_10000_11111; // E
+            // ROBOTS-2026-08-15: code 15 used to fall through to the blank default,
+            // so a value of F rendered as nothing. The segment index reaches F, and
+            // hex readouts are used for diagnostics, so give it a real glyph.
+            5'd15: glyph = 35'b11111_10000_10000_11110_10000_10000_10000; // F
             5'd16: glyph = 35'b11110_10001_10001_11110_10000_10000_10000; // P
             5'd17: glyph = 35'b10000_10000_10000_10000_10000_10000_11111; // L
             5'd18: glyph = 35'b11110_10001_10001_11110_10100_10010_10001; // R
-            default: glyph = 35'd0;                                       // 15 = blank
+            5'd19: glyph = 35'b01111_10000_10000_01110_00001_00001_11110; // S  (ROBOTS-2026-08-15)
+            5'd20: glyph = 35'b10001_11011_10101_10101_10001_10001_10001; // M  (ROBOTS-2026-08-15)
+            5'd21: glyph = 35'b01110_10001_10000_10011_10001_10001_01110; // G  (ROBOTS-2026-08-15)
+            // ROBOTS-2026-08-15: BLANK IS NOW CODE 31, NOT 15. Code 15 became a real
+            // 'F' glyph above, and the slot decoder used to emit 15 for empty slots --
+            // which would paint an F into every gap. Empty slots emit 31 now.
+            default: glyph = 35'd0;                                       // 31 = blank
         endcase
     endfunction
 
@@ -65,24 +89,42 @@ module led_band #(
     wire in_band = (hc >= X_START) && (hc < X_START + ((N_SLOT*PITCH) << SCALE_LOG2)) &&
                    (vc >= BAND_Y0) && (vc < BAND_Y0 + (FH << SCALE_LOG2));
 
-    // slot -> character (font code).  Dynamic slots pull led_digits[].
+    // ROBOTS-2026-08-15: slot map REWRITTEN for Robots. The old one was Dragon's
+    // Lair's arcade scoreboard -- "P1 <score> L <lives>  P2 <score> L <lives>  CR
+    // <credits>". Robots keeps no score, no lives and no credits, so every one of
+    // those labels was a lie about what the digits underneath meant.
+    //
+    // Reads:   F012345 S07 L7A3 C00F P1 M0
+    //
+    //   F <6>  frame number, decimal, most significant digit first
+    //   S <2>  current segment index, DECIMAL 00-21, numbered as in Robots.idx
+    //   L <3>  ] DIAG-REVERT-2026-08-15: A/V-sync. L = LIVE ring level (high =>
+    //   C <3>  ] credit-limited, low => bandwidth-limited). C = credit-blocks/sec.
+    //          ] Both hex. Remove these two groups (slots 12-20)
+    //          ] when the sync work is done -- digits 8-13 are theirs alone.
+    //   P <1>  1 = tape rolling, 0 = paused
+    //   M <1>  modal: 0 none, 1 "Restart? No", 2 "Restart? Yes"
+    //
+    // Labels are limited to glyphs this font has: 0-9 A-F P L R S M.
     reg [4:0] ch;
     always @* case (slot)
-        6'd0:  ch = 5'd16;                             6'd1:  ch = 5'd1;                            // "P1"
-        6'd3:  ch = {1'b0, led_digits[ 0*4 +: 4]};     6'd4:  ch = {1'b0, led_digits[ 1*4 +: 4]};
-        6'd5:  ch = {1'b0, led_digits[ 2*4 +: 4]};     6'd6:  ch = {1'b0, led_digits[ 3*4 +: 4]};
-        6'd7:  ch = {1'b0, led_digits[ 4*4 +: 4]};     6'd8:  ch = {1'b0, led_digits[ 5*4 +: 4]};   // P1 score 0-5
-        6'd10: ch = 5'd17;                                                                          // "L"
-        6'd11: ch = {1'b0, led_digits[ 6*4 +: 4]};                                                  // P1 lives
-        6'd14: ch = 5'd16;                             6'd15: ch = 5'd2;                            // "P2"
-        6'd17: ch = {1'b0, led_digits[ 8*4 +: 4]};     6'd18: ch = {1'b0, led_digits[ 9*4 +: 4]};
-        6'd19: ch = {1'b0, led_digits[10*4 +: 4]};     6'd20: ch = {1'b0, led_digits[11*4 +: 4]};
-        6'd21: ch = {1'b0, led_digits[12*4 +: 4]};     6'd22: ch = {1'b0, led_digits[13*4 +: 4]};   // P2 score 8-13
-        6'd24: ch = 5'd17;                                                                          // "L"
-        6'd25: ch = {1'b0, led_digits[ 7*4 +: 4]};                                                  // P2 lives
-        6'd28: ch = 5'd12;                             6'd29: ch = 5'd18;                           // "CR"
-        6'd31: ch = {1'b0, led_digits[14*4 +: 4]};     6'd32: ch = {1'b0, led_digits[15*4 +: 4]};   // credits 14,15
-        default: ch = 5'd15;                                                                        // blank
+        6'd0:  ch = 5'd15;                                                        // 'F'
+        6'd1:  ch = {1'b0, led_digits[ 0*4 +: 4]};   6'd2:  ch = {1'b0, led_digits[ 1*4 +: 4]};
+        6'd3:  ch = {1'b0, led_digits[ 2*4 +: 4]};   6'd4:  ch = {1'b0, led_digits[ 3*4 +: 4]};
+        6'd5:  ch = {1'b0, led_digits[ 4*4 +: 4]};   6'd6:  ch = {1'b0, led_digits[ 5*4 +: 4]};
+        6'd8:  ch = 5'd19;                                                        // 'S'
+        6'd9:  ch = {1'b0, led_digits[ 6*4 +: 4]};   6'd10: ch = {1'b0, led_digits[ 7*4 +: 4]};
+        6'd12: ch = 5'd17;                                                        // 'L'  (DIAG: ring level)
+        6'd13: ch = {1'b0, led_digits[ 8*4 +: 4]};   6'd14: ch = {1'b0, led_digits[ 9*4 +: 4]};
+        6'd15: ch = {1'b0, led_digits[10*4 +: 4]};
+        6'd17: ch = 5'd21;                                                        // 'G' game: packet + seed
+        6'd18: ch = {1'b0, led_digits[11*4 +: 4]};   6'd19: ch = {1'b0, led_digits[12*4 +: 4]};
+        6'd20: ch = {1'b0, led_digits[13*4 +: 4]};
+        6'd22: ch = 5'd16;                                                        // 'P'
+        6'd23: ch = {1'b0, led_digits[14*4 +: 4]};
+        6'd25: ch = 5'd20;                                                        // 'M'
+        6'd26: ch = {1'b0, led_digits[15*4 +: 4]};
+        default: ch = 5'd31;                                                      // blank (NOT 15)
     endcase
 
     wire [34:0] gbits = glyph(ch);
