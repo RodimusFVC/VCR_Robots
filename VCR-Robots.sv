@@ -1015,11 +1015,14 @@ fb_raster_reader #(
     // LINE-BUDGET: line time = H_TOTAL/pixel_clk, NOT cycles. At 100 MHz the pixel clock is
     // 12.5 MHz, so H_TOTAL 576 gave 46.08 us/line -- 20% LESS than the 57.60 us the 40 MHz
     // build was proven at, tightening the per-LINE fetch deadline the reader must meet.
-    // H_TOTAL 720 restores 57.60 us; V_TOTAL 579 then holds refresh above film rate.
-    //   refresh = 12.5e6/(720*579) = 29.9846 Hz vs film 29.97003 -> ratio 1.00049
-    // REVERT: .H_BP (16'd24) [the module default, i.e. delete this line] and .V_BP (16'd212)
-    .H_BP       (16'd168),
-    .V_BP       (16'd67)
+    // H_TOTAL 789 / V_TOTAL 528 is the MAXIMUM line time the geometry allows while keeping
+    // refresh above film rate: 789/12.5e6 = 63.12 us.  CE_DIV_LOG2=4 is unreachable (it would
+    // need H_TOTAL < H_ACT), so this is the ceiling at 100 MHz.
+    //   refresh = 12.5e6/(789*528) = 30.0053 Hz vs film 29.97003 -> ratio 1.00118
+    // REVERT one step: .H_BP (16'd168) / .V_BP (16'd67)   [57.60 us, ratio 1.00049]
+    // REVERT fully:    delete .H_BP (module default 24) / .V_BP (16'd212)
+    .H_BP       (16'd237),
+    .V_BP       (16'd16)
 ) rr (
     .clk(CLK_40M), .reset(reset),
     .frame_base_hw(fb_rd_base),             // FB-DOUBLEBUF-2026-07-15: was hardcoded 27'd0, see fb_buf_sel above
