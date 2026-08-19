@@ -267,80 +267,76 @@ def main():
                          "tiles": len(blobs), "w": im.width, "h": im.height,
                          "frames": frames})
 
+    # ------------------------------------------------------------------
+    # INPUTS ARE THE PREPARED MASTERS, NOT THE RAW SCANS (2026-08-19).
+    # Every stage below used to re-derive geometry from the raw scans and got it
+    # wrong in ways that were invisible here:
+    #   cards      "Cropped Cards" is uniform SIZE but unregistered CONTENT -- the
+    #              cards visibly bounce as a set. Now Aligned Cards/ (48/48).
+    #   answer     split each spread at width//2. The real gutter is off-centre by
+    #              up to 244 px. Now Aligned Answer Book/ (verified A..FF).
+    #   notes      notebook_entries() filtered on ink DENSITY and missed J, whose
+    #              thin glyph never touches its box. Now Aligned Notebook/ (32/32).
+    #   leaflet    a 2% row-ink rule cut the Tube off the map. Now Aligned Leaflet/.
+    #   gallery    singles at ~34% canvas fill. Now Aligned Gallery/ (paired).
+    #   ui         wrong palette and a serif face. Now Composed UI/.
+    # Regenerate a master with its Claude/build_*.py tool, not by editing here.
+    # ------------------------------------------------------------------
+    A = os.path.dirname(S.rstrip("/")) + "/scans" if False else S
+
+    def take(path, name, kind, box=(1920, 1080)):
+        if not os.path.exists(path):
+            problems.append(f"missing {path}")
+            return
+        emit(name, kind, fit(Image.open(path), *box))
+
     # 1. clue cards: half display size (blit 2x) + panel thumbnail
     for pk, d in PACKETS:
         for L, v in zip(CARD_LETTERS, CARD_VALUES):
             for side, val in (("0", "00"), ("1", v)):
-                p = f"{S}/Cropped Cards/{d}/{pk} - {L} - {val}.jpg"
-                if not os.path.exists(p):
-                    problems.append(f"missing {p}")
+                p_ = f"{A}/Aligned Cards/{d}/{pk} - {L} - {val}.jpg"
+                if not os.path.exists(p_):
+                    problems.append(f"missing {p_}")
                     continue
-                src = Image.open(p)
+                src = Image.open(p_)
                 emit(f"card_{pk[:3].lower()}_{L}_{side}", "card_half", fit(src, 450, 517))
                 emit(f"thumb_{pk[:3].lower()}_{L}_{side}", "card_thumb", fit(src, 280, 321))
 
-    # 2. answer book: each spread is two facing pages, one letter per page.
-    #    scan n -> letters (2n-2) and (2n-1), 1-indexed with A=1 (scan 9 = P,Q).
-    for n in range(1, 18):
-        p = f"{S}/Answer Book/Answer Book - {n:02d}.jpg"
-        if not os.path.exists(p):
-            problems.append(f"missing {p}")
-            continue
-        im = Image.open(p)
-        for half, idx in ((0, 2 * n - 2), (1, 2 * n - 1)):
-            if not (1 <= idx <= 32):
-                continue                      # front matter / trailing blank
-            pg = im.crop((half * im.width // 2, 0, (half + 1) * im.width // 2, im.height))
-            emit(f"answer_{LETTERS[idx-1]}", "answer", fit(pg, 1920, 1080))
+    # 2. answer book -- one page per letter, drop caps verified A..FF
+    for L in LETTERS:
+        take(f"{A}/Aligned Answer Book/answer_{L}.jpg", f"answer_{L}", "answer")
 
-    # 3. Baley's notebook: one image per lettered entry
-    nb = []
-    for n in range(1, 8):
-        p = f"{S}/Baley's Notebook/Baley's Notebook - {n:02d}.jpg"
-        if os.path.exists(p):
-            nb += notebook_entries(p)
-        else:
-            problems.append(f"missing {p}")
-    if len(nb) != 32:
-        problems.append(f"notebook: detected {len(nb)} entries, expected 32")
-    for i, e in enumerate(nb[:32]):
-        emit(f"notes_{LETTERS[i]}", "notes", fit(e, 1024, 1080))
+    # 3. Baley's notebook -- one entry per letter, spiral + rules kept
+    for L in LETTERS:
+        take(f"{A}/Aligned Notebook/notebook_{L}.jpg", f"notes_{L}", "notes")
 
     # 4. leaflet + map (player reference)
-    for f_ in ["Leaflet - Map", "Leaflet - Page 1", "Leaflet - Page 2", "Leaflet - Page 3"]:
-        p = f"{S}/Leaflet/{f_}.jpg"
-        if os.path.exists(p):
-            emit(f_.lower().replace(" - ", "_").replace(" ", ""), "leaflet",
-                 fit(Image.open(p), 1920, 1080))
-        else:
-            problems.append(f"missing {p}")
+    take(f"{A}/Aligned Leaflet/Map.jpg", "leaflet_map", "leaflet")
+    for n in (1, 2, 3):
+        take(f"{A}/Aligned Leaflet/Page {n}.jpg", f"leaflet_page{n}", "leaflet")
 
-    # 5. gallery / archive: everything the boxed game came with
-    gallery = [("box_front", f"{S}/Box Front.jpg"), ("box_back", f"{S}/Box Back.jpg"),
-               ("box_flap", f"{S}/Box Flap.jpg"), ("tape", f"{S}/Tape.jpg")]
-    for pk, d in PACKETS:
-        for side in ("Front", "Back"):
-            gallery.append((f"sleeve_{pk[:3].lower()}_{side.lower()}",
-                            f"{S}/Cards/{d}/Sleeve - {pk} - {side}.jpg"))
-    for nm, fn in [("notes_cover_front", "Baley's Notebook - Front Cover"),
-                   ("notes_cover_back", "Baley's Notebook - Back Cover")]:
-        gallery.append((nm, f"{S}/Baley's Notebook/{fn}.jpg"))
-    for nm, fn in [("answer_cover_front", "Answer Book - Front Cover"),
-                   ("answer_cover_back", "Answer Book - Back Cover")]:
-        gallery.append((nm, f"{S}/Answer Book/{fn}.jpg"))
-    for nm, p in gallery:
-        if os.path.exists(p):
-            emit(nm, "gallery", fit(Image.open(p), 1920, 1080))
-        else:
-            problems.append(f"missing {p}")
+    # 5. gallery / archive. Sleeves stay `sleeve_*`: reveal_of() puts them in the
+    #    ENDGAME tier because one sleeve is a whole seed -> answer-page table.
+    for nm, fn in [("box", "Box"), ("box_flap", "Box Flap"), ("tape", "Tape"),
+                   ("answer_covers", "Answer Book Covers"),
+                   ("notes_covers", "Notebook Covers")]:
+        take(f"{A}/Aligned Gallery/{fn}.jpg", nm, "gallery")
+    for pk, _d in PACKETS:
+        take(f"{A}/Aligned Gallery/Sleeve {pk}.jpg", f"sleeve_{pk[:3].lower()}", "gallery")
 
-    # 6. composed UI: buttons, suspect plates, outcome banners
-    for i, (lab, sub) in enumerate(BUTTONS):
-        emit(f"btn_{i}", "ui", card_button(426, 140, lab, sub, True))
-    for i, (nm, fac) in enumerate(SUSPECTS):
-        emit(f"suspect_{i:02d}", "ui", suspect_plate(760, 88, nm, fac))
-    emit("banner_win", "ui", banner(900, 130, "PERPETRATOR JAILED", (40, 154, 56)))
-    emit("banner_lose", "ui", banner(900, 130, "AN INNOCENT CONVICTED", (191, 32, 52)))
+    # 6. composed UI -- read from Composed UI/, generated by Claude/build_ui.py.
+    #    NOT drawn inline any more: the inline renderers used a (44,68,100) navy and a
+    #    serif face, when the card letter box is actually (71,68,103) slate and the
+    #    artwork is Avant Garde geometric sans. They also predate the difficulty tiles,
+    #    the RANDOM/CHOOSE mode tiles and PLAY AGAIN.
+    ui_dir = f"{A}/Composed UI"
+    if not os.path.isdir(ui_dir):
+        problems.append(f"missing {ui_dir}")
+    else:
+        for fn in sorted(os.listdir(ui_dir)):
+            if not fn.endswith(".png"):
+                continue
+            emit(os.path.splitext(fn)[0], "ui", Image.open(os.path.join(ui_dir, fn)))
 
     json.dump({"fbuf_limit": FBUF_LIMIT, "quality": Q, "total_frames": frame,
                "assets": manifest}, open(os.path.join(OUT, "manifest.json"), "w"), indent=1)
