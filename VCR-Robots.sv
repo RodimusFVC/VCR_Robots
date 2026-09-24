@@ -93,8 +93,12 @@ wire horz = 1'b1;
 // ORIGINAL:
 // assign VIDEO_ARX = horz ? ((!ar) ? 12'd320 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
 // assign VIDEO_ARY = horz ? ((!ar) ? 12'd252 : 12'd0) : ((!ar) ? 12'd4 : 12'd0);
-assign VIDEO_ARX = horz ? ((!ar) ? 12'd640 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
-assign VIDEO_ARY = horz ? ((!ar) ? 12'd500 : 12'd0) : ((!ar) ? 12'd4 : 12'd0);  // 4 : 3*(480+BAND_H)/480
+// ORIGINAL (512x480 video + band): ARX 640 / ARY 500
+// assign VIDEO_ARX = horz ? ((!ar) ? 12'd640 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
+// assign VIDEO_ARY = horz ? ((!ar) ? 12'd500 : 12'd0) : ((!ar) ? 12'd4 : 12'd0);  // 4 : 3*(480+BAND_H)/480
+// 960x540 square-pixel canvas = 16:9.
+assign VIDEO_ARX = horz ? ((!ar) ? 12'd16 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
+assign VIDEO_ARY = horz ? ((!ar) ? 12'd9  : 12'd0) : ((!ar) ? 12'd4 : 12'd0);
 
 `include "build_id.v"
 localparam CONF_STR = {
@@ -308,24 +312,12 @@ pause #(8,8,8,CORE_CLK_HZ/1000000) pause  // CLKSPD in MHz; was hardcoded 10 whi
 ///////////////                 Video                  ////////////////
 
 // ---- Raster video path (DDR framebuffer -> arcade_video) : FB-PIVOT-2026-07-04 ----
-wire [63:0] led_digits_flat;
 wire        rr_ce_pix, rr_hs, rr_vs, rr_hblank, rr_vblank;
 wire [15:0] rr_hpos, rr_vpos;
 wire  [7:0] rr_r, rr_g, rr_b;
-wire        led_lit;
-// LAYOUT-2026-07-04 (Option B — grow canvas): the LED band and the video are SEPARATE, never
-// overlaid.  The reader (fb_raster_reader #(.V_BAND(BAND_H))) grows the active frame to
-// FB_ROWS_HW+BAND_H rows (RES-512x480-2026-07-24: 480+12; was 240+12): rows 0..BAND_H-1 = black band strip ON TOP, rows BAND_H.. = the FULL, pixel-
-// exact 320x240 video (NO crop, NO scale).  led_band lights rows 2..8 (inside the strip), so the
-// composite mux is unchanged: red text where lit in the strip, black elsewhere in it, video below.
-// NB: VIDEO_ARX/ARY "Original" is 320:(240+BAND_H) so the video stays exact 4:3 — if BAND_H
-// changes, update that ratio too (see the VIDEO_ARX/ARY assigns above).
-// RES-512x480-FIX-2026-07-24: 12 -> 20. The 2x-magnified glyph needs BAND_Y0 + FH*2 = 16
-// rows; 20 leaves margin. ORIGINAL: localparam [15:0] BAND_H = 16'd12;
-localparam [15:0] BAND_H = 16'd20;             // reserved top strip height in rows (glyphs at rows 2..8)
-wire  [7:0] comp_r = led_lit ? 8'hFF : rr_r;   // red band text in the strip, video below
-wire  [7:0] comp_g = led_lit ? 8'h00 : rr_g;
-wire  [7:0] comp_b = led_lit ? 8'h00 : rr_b;
+wire  [7:0] comp_r = rr_r;
+wire  [7:0] comp_g = rr_g;
+wire  [7:0] comp_b = rr_b;
 wire [26:0] rr_rdaddr2;
 wire [15:0] rr_dout2;
 wire [63:0] rr_dout2_64;    // READ-COALESCE-2026-07-20: whole cached word from ddram read port 2
@@ -355,7 +347,8 @@ wire        rr_fill_idle;
 // RES-512x480-2026-07-24: first parameter is arcade_video's WIDTH -- the depth of video_mixer's
 // scandoubler/hq2x line buffers. It MUST be >= H_ACT or those buffers wrap mid-line.
 // ORIGINAL: arcade_video #(320,24) arcade_video
-arcade_video #(512,24) arcade_video
+// ORIGINAL (512-wide raster): arcade_video #(512,24) arcade_video
+arcade_video #(960,24) arcade_video   // WIDTH >= canvas width (CANVAS_W)
 (
 	.*,
 
@@ -444,7 +437,7 @@ Robots #(.CLK_HZ(CORE_CLK_HZ)) robots_inst
 	// fb_seek_hold is already in this CLK_40M domain, so no CDC is needed.
 	.disc_hold(fb_seek_hold),
 
-	.led_digits_o(led_digits_flat),
+	.led_digits_o(),
 	.dbg_led(dbg_led),
 	.ld_frame_o(ld_curr_frame_top), .ld_search_cmd_o(fb_seek_pulse),
 	.ld_playing_o(ld_playing_top),
@@ -533,25 +526,9 @@ dlv_streamer #(.CLK_HZ(CORE_CLK_HZ), .START_FRAME(17'd0)) dlv_strm (
     .pcm_l(pcm_l), .pcm_r(pcm_r),
     .ld_curr_frame(ld_curr_frame_top), .pause(pause_cpu),   // HLE-DRIVE-2026-07-04
     .aud_primed(fb_aud_primed), .hold_play(fb_seek_hold), .seek_flush(fb_seek_pulse),   // SEEK-HOLD/FLUSH-2026-07-20
-    .ld_playing(ld_playing_top),                            // AUDIO-GATE-2026-07-05
-    .dbg_aud_level(dbg_aud_level), .dbg_credit_rate(dbg_credit_rate)  // DIAG-REVERT-2026-08-15
+    .ld_playing(ld_playing_top)                             // AUDIO-GATE-2026-07-05
 );
 
-// DIAG-REVERT-2026-08-15: A/V-sync discriminator on the LED band's 6 free adjacent
-// slots (digits 8-13 = led_band slots 17-22, the old "P2 score" group).
-//   left  3 digits "L" = LIVE audio ring level 000-FFF (ring holds 93 ms)
-//                        high => fill keeps up, CREDIT is the limiter (audio slow)
-//                        low  => FILL is the limiter, i.e. SD bandwidth
-//   right 3 digits "C" = credit-blocked ticks in the LAST SECOND (saturates FFF)
-// Rebuilt 2026-08-15: the previous saturating TOTALS pegged at EEE within
-// seconds and discriminated nothing. A level and a rate do.
-// Nibbles are reversed per group because digit 8 is the LEFTMOST slot, so the
-// most-significant nibble has to sit in the LOWEST digit index to read naturally.
-wire [11:0] dbg_aud_level, dbg_credit_rate;
-wire [63:0] led_digits_dbg = { led_digits_flat[63:56],                 // 15,14 from Robots.sv
-                               led_digits_flat[55:44],                                  // 13-11 packet+seed
-                               dbg_aud_level[3:0],   dbg_aud_level[7:4],   dbg_aud_level[11:8],
-                               led_digits_flat[31:0] };                // 7..0 from Robots.sv
 
 // ---- JPEG frame decoder: byte stream -> px writes (block-order, addressed by x,y) ----
 wire        dec_px_we, dec_px_ready;
@@ -620,6 +597,12 @@ jpeg_frame_decoder dec (
 localparam [15:0] FB_COLS_HW   = 16'd512;
 localparam [15:0] FB_ROWS_HW   = 16'd480;
 localparam [26:0] FB_BUF_HW    = 27'd245760;  // 512*480 halfwords per buffer (was 76800)
+// Display canvas (square pixels, sys scales 2x to 1080p). Video window at (VID_X, VID_Y); rest is panel.
+localparam [15:0] CANVAS_W     = 16'd960;
+localparam [15:0] CANVAS_H     = 16'd540;
+localparam [15:0] VID_X        = 16'd0;
+localparam [15:0] VID_Y        = 16'd30;
+localparam [15:0] CANVAS_BG    = 16'h10A3;    // RGB565 near-black blue, matches the layout mockup
 localparam [26:0] FB_BUF0_HW   = 27'd0;
 localparam [26:0] FB_BUF1_HW   = FB_BUF_HW;
 localparam [26:0] FB_BUF2_HW   = FB_BUF_HW * 2;
@@ -736,7 +719,8 @@ fb_writer #(
     .STRIDE_HW (FB_COLS_HW),
     .FB_COLS   (FB_COLS_HW),
     .FB_ROWS   (FB_ROWS_HW),
-    .CLEAR_ROWS(FB_ROWS_HW)
+    .CLEAR_ROWS(FB_ROWS_HW),
+    .COALESCE  (1'b0) // Disabled!
 ) fb_wr (
     .clk(CLK_40M), .reset(reset),
     .px_we(dec_px_we), .px_x(dec_px_x), .px_y(dec_px_y),
@@ -781,11 +765,21 @@ ddram ddram_fb (
 // ⚠️ CE_DIV_LOG2 is the BANDWIDTH DIAL: DDR read traffic scales directly with refresh. If 512x480
 // starves, set 3'd2 (clk/4 = 33.4 Hz, still above content rate) to halve reads before changing
 // anything structural. ORIGINAL: fb_raster_reader #(.V_BAND(BAND_H)) rr (
+// ORIGINAL (512x480 raster, band strip on top): .H_ACT(FB_COLS_HW) .V_ACT(FB_ROWS_HW) .STRIDE(FB_COLS_HW)
+//   .V_BAND(BAND_H) .CE_DIV_LOG2(3'd3) .H_BP(16'd237) .V_BP(16'd16)
+// 960x540 canvas: pixel = 100/4 = 25 MHz, 1152 x 724 total -> 29.9749 Hz (ratio 1.00016 to film),
+// 46.08 us/line -- the V_TOTAL and line time this core already ran at 100 MHz. LED band sits in the
+// 30-row strip above the video, so no V_BAND.
 fb_raster_reader #(
-    .H_ACT      (FB_COLS_HW),
-    .V_ACT      (FB_ROWS_HW),
+    .H_ACT      (CANVAS_W),
+    .V_ACT      (CANVAS_H),
     .STRIDE     (FB_COLS_HW),
-    .V_BAND     (BAND_H),
+    .V_BAND     (16'd0),
+    .VID_X      (VID_X),
+    .VID_Y      (VID_Y),
+    .VID_W      (FB_COLS_HW),
+    .VID_H      (FB_ROWS_HW),
+    .BG         (CANVAS_BG),
     // RES-512x480-FIX-2026-07-24: was 3'd1 (clk/2, 66.8 Hz). HW result: **bottom of the picture cut
     // off** -- the classic fill-stall signature. The reader must fetch H_ACT/4 = 128 words inside ONE
     // line-time; at clk/2 that is 576*2 = 1152 cycles = only 9 cycles per DDR request, which it
@@ -802,7 +796,8 @@ fb_raster_reader #(
     // pixel clock instead restores a normal shape: V_TOTAL 724, i.e. essentially
     // DL's HW-proven 725. Also gives the DDR MORE cycles per line (4608 vs 2304),
     // on top of the 2.5x faster memory clock.
-    .CE_DIV_LOG2(3'd3),
+    // .CE_DIV_LOG2(3'd3),   // ORIGINAL
+    .CE_DIV_LOG2(3'd2),
 
     // ---- CADENCE-FIX-2026-07-24 ------------------------------------------------------------
     // SYMPTOM this addresses (user, on Space Ace): "the graphics are very jumpy" -- specifically
@@ -869,8 +864,10 @@ fb_raster_reader #(
     //   refresh = 12.5e6/(789*528) = 30.0053 Hz vs film 29.97003 -> ratio 1.00118
     // REVERT one step: .H_BP (16'd168) / .V_BP (16'd67)   [57.60 us, ratio 1.00049]
     // REVERT fully:    delete .H_BP (module default 24) / .V_BP (16'd212)
-    .H_BP       (16'd237),
-    .V_BP       (16'd16)
+    // .H_BP       (16'd237),   // ORIGINAL
+    // .V_BP       (16'd16)     // ORIGINAL
+    .H_BP       (16'd152),      // 960+8+32+152 = 1152
+    .V_BP       (16'd172)       // 540+8+4+172  = 724
 ) rr (
     .clk(CLK_40M), .reset(reset),
     .frame_base_hw(fb_rd_base),             // FB-DOUBLEBUF-2026-07-15: was hardcoded 27'd0, see fb_buf_sel above
@@ -883,14 +880,5 @@ fb_raster_reader #(
     .vid_r(rr_r), .vid_g(rr_g), .vid_b(rr_b)
 );
 
-// RES-512x480-FIX-2026-07-24: recentre for 512 wide and magnify 2x (see led_band.v).
-//   X_START = (512 - 33*6*2)/2 = 58.  ORIGINAL: led_band led_band_i (
-led_band #(.X_START(16'd58), .SCALE_LOG2(2'd1)) led_band_i (
-    .hc(rr_hpos), .vc(rr_vpos),
-    // DIAG-REVERT-2026-08-15: original below, uncomment to restore
-    // .led_digits(led_digits_flat),   // real score/lives, restored 2026-07-15
-    .led_digits(led_digits_dbg),    // DIAG: A/V-sync counters in digits 8-13
-    .seg_lit(led_lit)
-);
 
 endmodule

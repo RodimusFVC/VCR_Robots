@@ -47,7 +47,13 @@ module fb_raster_reader #(
     // This is also the BANDWIDTH DIAL: DDR read traffic scales directly with refresh rate, so if
     // 512x480 turns out to be bandwidth-starved, raise this to 3'd2 (clk/4 = 33.4 Hz) and halve
     // the read load before touching anything structural.
-    parameter [2:0]  CE_DIV_LOG2 = 3'd3
+    parameter [2:0]  CE_DIV_LOG2 = 3'd3,
+    // Video window inside the H_ACT x V_ACT canvas; outside it the reader outputs BG (no DDR reads).
+    parameter [15:0] VID_X = 16'd0,          // must be a multiple of 4
+    parameter [15:0] VID_Y = 16'd0,          // rows below the band
+    parameter [15:0] VID_W = H_ACT,          // halfwords fetched per video row (multiple of 4, <= 1024)
+    parameter [15:0] VID_H = V_ACT,
+    parameter [15:0] BG    = 16'h0000        // RGB565 canvas background
 )(
     input             clk,            // CLK_40M (= DDRAM_CLK)
     input             reset,          // active-high
@@ -100,10 +106,13 @@ module fb_raster_reader #(
     wire v_last = (vcnt == V_TOTAL - 16'd1);
     wire h_active = (hcnt < H_ACT);
     wire v_active = (vcnt < V_DISP);   // active rows 0..V_DISP-1 = band strip + full video (Option B)
+    wire [15:0] vid_x  = hcnt - VID_X;                    // named wire: no expression bit-select in .v
+    wire        in_vid = (hcnt >= VID_X) && (hcnt < VID_X + VID_W) &&
+                         (vcnt >= V_BAND + VID_Y) && (vcnt < V_BAND + VID_Y + VID_H);
 
     // ping-pong line buffer: 2 lines, 512-halfword stride (matches the
     // {buf, hcnt[8:0]} / {buf, fidx[8:0]} index — H_ACT<=512).
-    reg  [15:0] linebuf [0:1023];
+    reg  [15:0] linebuf [0:2047];            // 2 lines x 1024 halfwords, index {buf, x[9:0]}
     reg         disp_buf = 1'b0;
     wire        fill_buf = ~disp_buf;
 
@@ -113,6 +122,7 @@ module fb_raster_reader #(
     // exactly one always block -- can't split them and assign fill_done_q from both.
     reg [15:0] pix_q;
     reg        active_q;
+    reg        vid_q;          // pixel in pix_q lies inside the video window
 
     // ---- DDR fill FSM state: fetch fline into fill_buf, self-paced (NOT tied to a one-line
     // deadline). Previously gated on a once-per-raster-line pulse and always targeted `vcnt+1` --
@@ -144,6 +154,7 @@ module fb_raster_reader #(
     reg [15:0] fline;
     reg        fill_done_q;    // 1 once fline's data is fully loaded into fill_buf, awaiting the swap below
     wire [15:0] fline_next = (fline == V_TOTAL - 16'd1) ? 16'd0 : fline + 16'd1;
+    wire [15:0] frow       = fline - V_BAND - VID_Y;   // framebuffer row for the line being fetched
 
     // VSYNC-RESYNC-2026-07-15: the fill FSM's content-row target (fline) runs decoupled from raster
     // timing (vcnt) so a stalled fetch can be repeated instead of torn -- but with no periodic
@@ -166,7 +177,7 @@ module fb_raster_reader #(
     always @(posedge clk) begin
         if (reset) begin
             hcnt <= 0; vcnt <= 0; disp_buf <= 1'b0;
-            hsync <= 0; vsync <= 0; hblank <= 1; vblank <= 1; active_q <= 0;
+            hsync <= 0; vsync <= 0; hblank <= 1; vblank <= 1; active_q <= 0; vid_q <= 0;
             hpos <= 16'd0; vpos <= 16'd0;
             fst <= F_IDLE; fidx <= 16'd0; rd_req2 <= 1'b0; rdaddr2 <= 27'd0;
             frame_base_hw_q <= 27'd0;
@@ -176,7 +187,8 @@ module fb_raster_reader #(
             // ---- display timing (ce_pix-gated) ----
             if (ce_pix) begin
                 // read this pixel and register the aligned timing flags
-                pix_q    <= linebuf[{disp_buf, hcnt[8:0]}];
+                pix_q    <= linebuf[{disp_buf, vid_x[9:0]}];   // plain registered read keeps BRAM inference
+                vid_q    <= in_vid;
                 active_q <= h_active & v_active & (vcnt >= V_BAND);  // reserved top strip -> black (LED band composites there)
                 hpos     <= hcnt;   vpos <= vcnt;
                 hblank   <= ~h_active;
@@ -222,8 +234,8 @@ module fb_raster_reader #(
             F_REQ:
                 // display line `fline` shows framebuffer row (fline - V_BAND); rows inside the
                 // reserved band (fline < V_BAND) fetch nothing (they're blanked to black anyway).
-                if (fline >= V_BAND && (fline - V_BAND) < V_ACT) begin
-                    rdaddr2 <= frame_base_hw_q + (fline - V_BAND)*STRIDE + fidx;
+                if (fline >= V_BAND + VID_Y && frow < VID_H) begin
+                    rdaddr2 <= frame_base_hw_q + frow*STRIDE + fidx;
                     rd_req2 <= ~rd_req2;                    // issue read
                     fst     <= F_WAIT;
                 end else begin
@@ -233,7 +245,7 @@ module fb_raster_reader #(
             F_WAIT:
                 if (rd_ack2 == rd_req2) begin               // dout2/dout2_64 valid
                     // READ-COALESCE-2026-07-20: store halfword 0 now, hold 1..3 for F_STORE.
-                    linebuf[{fill_buf, fidx[8:0]}] <= dout2_64[15:0];
+                    linebuf[{fill_buf, fidx[9:0]}] <= dout2_64[15:0];
                     fw_hold <= dout2_64[63:16];
                     fw_cnt  <= 2'd0;
                     fw_idx  <= fidx + 16'd1;     // named reg: NO expression bit-select in a .v file
@@ -241,11 +253,11 @@ module fb_raster_reader #(
                 end
             F_STORE: begin
                 // write halfwords 1,2,3 of the fetched word on successive cycles
-                linebuf[{fill_buf, fw_idx[8:0]}] <= fw_hold[15:0];
+                linebuf[{fill_buf, fw_idx[9:0]}] <= fw_hold[15:0];
                 fw_hold <= {16'd0, fw_hold[47:16]};
                 fw_idx  <= fw_idx + 16'd1;
                 if (fw_cnt == 2'd2) begin
-                    if (fidx + 16'd4 >= H_ACT) begin        // whole line landed
+                    if (fidx + 16'd4 >= VID_W) begin        // whole line landed
                         fst         <= F_IDLE;
                         fill_done_q <= 1'b1;
                     end else begin
@@ -266,7 +278,8 @@ module fb_raster_reader #(
     // read2 right now".  (Delete this assign + the port on revert.)
     assign fill_idle = fill_done_q;
 
-    assign vid_r = active_q ? {pix_q[15:11], pix_q[15:13]} : 8'd0;  // 5->8
-    assign vid_g = active_q ? {pix_q[10:5],  pix_q[10:9]}  : 8'd0;  // 6->8
-    assign vid_b = active_q ? {pix_q[4:0],   pix_q[4:2]}   : 8'd0;  // 5->8
+    wire [15:0] px = vid_q ? pix_q : BG;
+    assign vid_r = active_q ? {px[15:11], px[15:13]} : 8'd0;  // 5->8
+    assign vid_g = active_q ? {px[10:5],  px[10:9]}  : 8'd0;  // 6->8
+    assign vid_b = active_q ? {px[4:0],   px[4:2]}   : 8'd0;  // 5->8
 endmodule

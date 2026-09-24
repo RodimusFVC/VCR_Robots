@@ -83,14 +83,7 @@ module dlv_streamer #(
     // old-segment audio on release -- i.e. it held but did NOT align. Flush + refill-while-held +
     // release-with-video = the actual alignment the user asked for. (The existing seek_req/jump_w
     // machinery re-points aud_lba to the new segment, so the refill sources the correct audio.)
-    input             seek_flush,
-
-    // DIAG-REVERT-2026-08-15: A/V-sync instrumentation. Read-only counters, no
-    // behavioural effect -- delete these two ports and the block above endmodule
-    // to revert. They exist to answer "WHY did the audio fail to drain?" without
-    // anyone having to judge lip-sync direction by ear.
-    output     [11:0] dbg_aud_level,      // LIVE ring occupancy (0..4095)
-    output reg [11:0] dbg_credit_rate     // credit-blocked ticks in the LAST SECOND
+    input             seek_flush
 );
     //------------------------------------------------------------------------
     // Compressed-frame BRAM (video)
@@ -268,8 +261,8 @@ module dlv_streamer #(
     //------------------------------------------------------------------------
     // 30 fps frame pacer + pending latch (single-driver on frame_pending)
     //------------------------------------------------------------------------
-    localparam [20:0] FRAME_DIV = 21'd1333333;   // 40e6/30
-    reg [20:0] frame_cnt;
+    localparam [21:0] FRAME_DIV = (64'd1333333 * CLK_HZ) / 64'd40_000_000;   // 30 Hz at any CLK_HZ
+    reg [21:0] frame_cnt;
     reg        frame_tick;
     reg        frame_pending;
     // FETCH-PHASE-LOCK-2026-07-25: content-change detect, driven below (after vid_target is
@@ -292,7 +285,7 @@ module dlv_streamer #(
     always @(posedge clk) begin
         frame_tick <= 1'b0;
         if (reset) frame_cnt <= FRAME_DIV;
-        else if (frame_cnt == 21'd0) begin frame_cnt <= FRAME_DIV; frame_tick <= 1'b1; end
+        else if (frame_cnt == 22'd0) begin frame_cnt <= FRAME_DIV; frame_tick <= 1'b1; end
         else frame_cnt <= frame_cnt - 1'b1;
     end
 
@@ -1033,95 +1026,6 @@ module dlv_streamer #(
                 last_fetched_frame <= {17{1'b1}};
                 state     <= S_READY;
             end
-        end
-    end
-
-    //------------------------------------------------------------------------
-    // DIAG-REVERT-2026-08-15: A/V-SYNC DISCRIMINATOR. Delete this whole block and
-    // the two ports to revert. Read-only -- drives nothing but the LED band.
-    //
-    // The audio drain has exactly two possible blockers, and they mean opposite
-    // things. This counts them separately so the cause is a NUMBER, not a
-    // judgement call about whether sound is early or late:
-    //
-    // ⛔ REBUILT 2026-08-15. The first version used two SATURATING TOTALS and was
-    // useless: they capped at 0xEEE = 3,822 events = 0.09 s of sample ticks, so
-    // ANY nonzero rate pegged both within seconds. On HW both read EEE, which
-    // said only "both happen" -- no discrimination at all. Do not go back to
-    // cumulative counters here; the useful quantities are a LEVEL and a RATE.
-    //
-    //   dbg_aud_level   LIVE ring occupancy, 0..4095 (ring is 4096 words = 93 ms).
-    //       Hovers HIGH (near FILL_HIGH 0xF7F)  -> the fill keeps up and the
-    //           CREDIT is the limiter: audio plays slow, drifts BEHIND.
-    //       Hovers LOW / near 0                 -> the FILL is the limiter, i.e.
-    //           SD bandwidth (the ~1.5x-DL concern). Credit tuning cannot fix it.
-    //       Sits comfortably mid/high AND sync is still wrong -> neither rate is
-    //           at fault; it is a fixed pipeline offset, a different fix entirely.
-    //
-    //   dbg_credit_rate credit-blocked ticks in the LAST SECOND, direct count,
-    //       saturating at 0xFFF. Direct (not scaled) on purpose: the deficit we
-    //       are hunting is ~15/s, which reads as 00F. A scaled counter would
-    //       round exactly that case to zero.
-    //
-    // Placed here, after aud_wr/aud_rd (149), samp_tick (303), aud_credit (378)
-    // and aud_muted (382): Quartus 17.0 rejects use-before-declaration.
-    //------------------------------------------------------------------------
-    // 2026-08-15: L repurposed to name the CULPRIT. C proved the loss is real and
-    // bursty (~3100 samples/s = 70 ms lost in a spike) but not WHY. aud_muted has
-    // four causes and the previous counters could not separate them, so:
-    //   digit [11:8] = sticky cause bitmask, latched per second
-    //        bit3 hold_play (seek-hold)   bit2 !ld_playing
-    //        bit1 on_leader               bit0 !header_valid
-    //   digits [7:0] = ring level >> 4 (coarse 00-FF; FF would be full)
-    // Reading "8nn" => the seek-hold is muting audio. "4nn" => ld_playing dropping.
-    // "0nn" with C spiking => neither: the loss is ring-empty or credit, not muting.
-    reg  [3:0]  dbg_cause_acc, dbg_cause_q;
-    wire [3:0]  dbg_cause_now = {hold_play, !ld_playing, on_leader, !header_valid};
-    always @(posedge clk) begin
-        if (reset) begin
-            dbg_cause_acc <= 4'd0;  dbg_cause_q <= 4'd0;
-        end else if (dbg_sec >= (ACC_MOD - 28'd1)) begin
-            dbg_cause_q   <= dbg_cause_acc;   // latch the completed second
-            dbg_cause_acc <= 4'd0;
-        end else begin
-            dbg_cause_acc <= dbg_cause_acc | dbg_cause_now;
-        end
-    end
-    // AUD_AW went 12 -> 14, so aud_level is 14 bits now. This was still slicing
-    // [11:4] and silently dropping the top TWO bits -- the level half wrapped and
-    // was meaningless (a real level of 15871 displayed as 0x3F). Slice from the top
-    // instead so the byte is always "fraction of the ring, full scale = FF",
-    // whatever AUD_AW is.
-    // ORIGINAL: assign dbg_aud_level = {dbg_cause_q, aud_level[11:4]};
-    assign dbg_aud_level = {dbg_cause_q, aud_level[AUD_AW-1 -: 8]};
-
-    // ⛔ REVISED AGAIN 2026-08-15. The previous "credit-blocked ticks" counter had a
-    // BLIND SPOT: it required !aud_muted, so it reads 000 both when credit never
-    // blocks AND when we are muted so often we rarely try to drain. It cannot tell
-    // those apart, and 000 was overread as "credit is fine".
-    //
-    // This counts the OUTCOME instead -- samples that actually reach the DAC. The
-    // drain must average exactly 44,100/s for audio to be real-time, whatever the
-    // mechanism. So: samples SHORT of 44,100 in the last second.
-    //     000  audio is exactly real-time  -> any sync error is a fixed OFFSET
-    //     nnn  audio is running slow by nnn samples/s -> DRIFT, and nnn is the rate
-    //          (00F = the ~15/s credit deficit; larger = mute/underrun stalls)
-    // Saturates FFF. Negative (running fast) clamps to 000 -- not expected, the
-    // drain cannot exceed samp_tick.
-    reg [27:0] dbg_sec;          // 40 MHz second
-    reg [16:0] dbg_drained;      // samples actually drained this second
-    always @(posedge clk) begin
-        if (reset) begin
-            dbg_sec <= 28'd0;  dbg_drained <= 17'd0;  dbg_credit_rate <= 12'd0;
-        end else if (dbg_sec >= (ACC_MOD - 28'd1)) begin
-            dbg_sec     <= 26'd0;
-            dbg_credit_rate <= (dbg_drained >= 17'd22050) ? 12'd0 :
-                               ((17'd22050 - dbg_drained) > 17'd4095) ? 12'hFFF :
-                               (17'd22050 - dbg_drained);
-            dbg_drained <= 17'd0;
-        end else begin
-            dbg_sec <= dbg_sec + 28'd1;
-            if (aud_drain && (dbg_drained != 17'h1FFFF)) dbg_drained <= dbg_drained + 17'd1;
         end
     end
 
