@@ -115,7 +115,12 @@ end
 //-----------------------------------------------------------------
 wire [15:0] width_rnd_w   = ((img_width_i+7) / 8) * 8;
 wire [15:0] block_x_max_w = width_rnd_w / 8;
-wire [15:0] img_w_div4_w  = width_rnd_w / 4;
+// Local fix: 4:2:0 MCUs are 16 px wide, so the 4:2:0 path must round the width to 16, not 8
+// (a width like 279 otherwise shears the image one MCU per row). Identical for widths that are
+// multiples of 16. Original: wire [15:0] img_w_div4_w  = width_rnd_w / 4;
+wire [15:0] width_rnd16_w  = ((img_width_i+15) / 16) * 16;
+wire [15:0] img_w_div4_w   = width_rnd16_w / 4;
+wire [15:0] block_x_max420_w = width_rnd16_w / 8;
 
 reg  [15:0] block_x_q;
 reg  [15:0] block_y_q;
@@ -176,7 +181,8 @@ begin
 end
 else if (start_of_block_i && img_mode_i == JPEG_YCBCR_420 && block_type_q == BLOCK_CR)
 begin
-    if (img_end_i && block_x_next_w == block_x_max_w)
+    // Original: if (img_end_i && block_x_next_w == block_x_max_w)
+    if (img_end_i && block_x_next_w == block_x_max420_w)
         end_of_image_q <= 1'b1;
 end
 

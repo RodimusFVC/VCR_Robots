@@ -83,8 +83,21 @@ module dlv_streamer #(
     // old-segment audio on release -- i.e. it held but did NOT align. Flush + refill-while-held +
     // release-with-video = the actual alignment the user asked for. (The existing seek_req/jump_w
     // machinery re-points aud_lba to the new segment, so the refill sources the correct audio.)
-    input             seek_flush
+    input             seek_flush,
+
+    // Asset blit: fetch any .dlv frame (e.g. an appended asset) for decoding into the panel.
+    // Toggle blit_req with blit_frame stable; blit_ack follows when the fetch starts.
+    input             blit_req,
+    input      [16:0] blit_frame,
+    output reg        blit_ack,
+    input             dec_idle,     // decoder finished its last frame: a blit fetch may reset it
+    input             blit_hold,    // a blit is still decoding: do not start a video fetch
+    output reg        fetch_blit,   // the frame being fetched/decoded is a blit, not video
+    output reg        blit_start,   // one-cycle pulse when a blit fetch starts
+    output            blit_fail,    // one-cycle pulse: the wedge watchdog aborted a blit fetch (retry it)
+    output reg [16:0] tape_frames   // header @24: first asset frame (0 = no assets); valid with the header
 );
+    reg [16:0] tape_frames_hdr;         // being captured from the header sector
     //------------------------------------------------------------------------
     // Compressed-frame BRAM (video)
     //------------------------------------------------------------------------
@@ -232,10 +245,25 @@ module dlv_streamer #(
     // that same COUNT is 20 ms -- SHORTER than a 33.4 ms frame period -- so the wedge
     // watchdog would abort legitimate fetches forever and no frame could complete.
     // Derived so 50 ms stays 50 ms at any clock. 24 bits covers up to ~335 MHz.
-    localparam [23:0] WD_LIMIT = CLK_HZ[23:0] / 24'd20;   // 50 ms at any CLK_HZ
-    reg  [23:0] wd_cnt;
+    // BLIT-RETRY-2026-09-25: an asset blit is not time-critical and is ~75 KB of SD reads; one 50 ms
+    // SD hiccup must delay it, not abort it. Blits get 500 ms (the scheduler's 1 s timeout still bounds
+    // them). Original: localparam [23:0] WD_LIMIT = ...; reg [23:0] wd_cnt; wd_fire = (wd_cnt == WD_LIMIT)
+    localparam [27:0] WD_LIMIT      = CLK_HZ[27:0] / 28'd20;   // 50 ms at any CLK_HZ (video)
+    localparam [27:0] WD_LIMIT_BLIT = CLK_HZ[27:0] / 28'd2;    // 500 ms (asset blits)
+    reg  [27:0] wd_cnt;
     reg  [3:0]  wd_rst_cnt;                     // holds dec_reset for 16 clk after an abort
     reg  [3:0]  wd_state;                       // state that timed out
+    // TIMING-PIPE-2026-09-25: ld_curr_frame comes from the game FSM with no slack left; every internal use reads this
+    // registered copy, and the targets derived from it are pipelined (see vid_target_r / aud_target_lba_r).
+    // tgt_ok is low until a change has flowed through that pipeline: fetch and seek re-point wait on it.
+    reg  [16:0] ld_q = 17'd0;
+    reg   [2:0] tgt_settle = 3'd0;
+    always @(posedge clk) begin
+        ld_q <= ld_curr_frame;
+        if (ld_curr_frame != ld_q) tgt_settle <= 3'd6;
+        else if (tgt_settle != 3'd0) tgt_settle <= tgt_settle - 3'd1;
+    end
+    wire        tgt_ok = (tgt_settle == 3'd0);
     reg  [16:0] wd_frame;                       // ld_curr_frame at the wedge
     reg  [15:0] wd_trips;                       // total aborts since reset
     wire        wd_rst  = (wd_rst_cnt != 4'd0);
@@ -250,7 +278,9 @@ module dlv_streamer #(
     wire        wd_arm  = (state == S_RD_ISSUE) || (state == S_STRM_VLD);
     // any forward progress re-arms the timer: SD data landing, or a byte accepted
     wire        wd_prog = sd_buff_wr || (out_valid && out_ready);
-    wire        wd_fire = (wd_cnt == WD_LIMIT);
+    wire [27:0] wd_lim  = fetch_blit ? WD_LIMIT_BLIT : WD_LIMIT;
+    wire        wd_fire = (wd_cnt == wd_lim);
+    assign      blit_fail = wd_fire & fetch_blit;   // BLIT-RETRY-2026-09-25
 
     // WEDGE-WATCHDOG-2026-07-24: original below, uncomment (and delete wd_rst) to revert.
     // assign dec_reset = reset | frame_fetch;   // per-frame decoder reset (decoder only)
@@ -278,9 +308,12 @@ module dlv_streamer #(
     // S_READY.  The re-mount branch remains exclusive, so it is excluded here.
     // Original: `wire frame_start = (state == S_READY) && header_valid && frame_pending
     //                               && (aud_level >= FILL_LOW);`
+    // BLIT-PRIORITY-2026-09-25: the blit branch now comes before the video branch, so a cycle where it wins
+    // must not clear frame_pending (that would swallow the video tick). Original: without && !blit_go.
+    wire       blit_go     = (blit_req != blit_ack) && dec_idle && !blit_hold && (aud_level >= FILL_LOW);
     wire       frame_start = (state == S_READY) && header_valid && frame_pending
-                             && (aud_level >= FILL_LOW)
-                             && !(img_mounted && (img_size != 64'd0));
+                             && (aud_level >= FILL_LOW) && !blit_hold
+                             && !(img_mounted && (img_size != 64'd0)) && !blit_go;
 
     always @(posedge clk) begin
         frame_tick <= 1'b0;
@@ -358,7 +391,8 @@ module dlv_streamer #(
     // ld_curr_frame starts at 0 and free-runs up through the leader during the very first PLAY at
     // boot, so without this the disc_rel clamp-to-0 (below) aliases the whole 5s leader traversal
     // to "frame 0 of real content" and plays the movie's true opening audio 5s early.
-    wire on_leader = (ld_curr_frame < ld_leader);   // ld_leader now header-driven, see HEADER-FIELDS-2026-07-05 below
+    // TIMING-PIPE-2026-09-25 original: wire on_leader = (ld_curr_frame < ld_leader);
+    wire on_leader = (ld_q < ld_leader);   // ld_leader now header-driven, see HEADER-FIELDS-2026-07-05 below
 
     // SAMP-PER-FRAME-2026-07-20: COMPUTED from ACTUAL DATA COUNTS, not hardcoded and NOT from
     // mpeg_fpks. ⚠️ mpeg_fpks is UNRELIABLE -- Space Ace's is garbage (41218 = impossible fps), and
@@ -392,7 +426,8 @@ module dlv_streamer #(
     reg  [16:0] aud_prev_frame;
     reg  [13:0] aud_credit;                       // samples the disc position currently permits
     localparam [13:0] AUD_CREDIT_MAX = 14'd7368;  // 4 frames -- anti-burst cap on catch-up
-    wire [16:0] aud_fadv  = ld_curr_frame - aud_prev_frame;    // unsigned; a large value = a jump
+    // TIMING-PIPE-2026-09-25 original: wire [16:0] aud_fadv  = ld_curr_frame - aud_prev_frame;
+    wire [16:0] aud_fadv  = ld_q - aud_prev_frame;    // unsigned; a large value = a jump
     wire        aud_jump  = (aud_fadv > 17'd2);                // >2 frames/cycle = seek, not 1x play
     wire        aud_muted = hold_play || !ld_playing || on_leader || !header_valid;
     wire        aud_drain = samp_tick && (aud_wr != aud_rd) && (aud_credit != 14'd0) && !aud_muted;
@@ -497,12 +532,12 @@ module dlv_streamer #(
             aud_rd <= {AUD_AW{1'b0}};
             pcm_l  <= 16'sd0;
             pcm_r  <= 16'sd0;
-            aud_prev_frame <= ld_curr_frame;
+            aud_prev_frame <= ld_q;   // TIMING-PIPE-2026-09-25 was ld_curr_frame
             aud_credit     <= 14'd0;
         end else begin
             // FRAME-LOCK-2026-07-20: credit + prev_frame advance EVERY cycle (independent of the
             // mute/drain branch below). A frame jump auto-flushes the credit.
-            aud_prev_frame <= ld_curr_frame;
+            aud_prev_frame <= ld_q;   // TIMING-PIPE-2026-09-25 was ld_curr_frame
             aud_credit     <= aud_jump ? 14'd0 : aud_cred_cap;
 
             // AUDIO-GATE-2026-07-05: not PLAYing / on the leader / header not parsed / SEEK-HOLD ->
@@ -570,7 +605,8 @@ module dlv_streamer #(
     wire [16:0] ld_leader  = (ld_leader_s <= 32'sd0)      ? 17'd0     :
                              (ld_leader_s > 32'sd131071)  ? 17'h1FFFF : ld_leader_s[16:0];
     // ORIGINAL: wire [16:0] disc_rel = (ld_curr_frame > ld_leader) ? (ld_curr_frame - ld_leader) : 17'd0;
-    wire signed [31:0] disc_rel_s = $signed({15'd0, ld_curr_frame}) - ld_leader_s;
+    // TIMING-PIPE-2026-09-25 original: wire signed [31:0] disc_rel_s = $signed({15'd0, ld_curr_frame}) - ld_leader_s;
+    wire signed [31:0] disc_rel_s = $signed({15'd0, ld_q}) - ld_leader_s;
     wire [16:0] disc_rel   = (disc_rel_s <= 32'sd0)       ? 17'd0     :
                              (disc_rel_s > 32'sd131071)   ? 17'h1FFFF : disc_rel_s[16:0];
 
@@ -621,8 +657,19 @@ module dlv_streamer #(
     wire [16:0] disc_rel_aud   = (disc_rel > AUD_LEAD_FRAMES) ? (disc_rel - AUD_LEAD_FRAMES)
                                                               : 17'd0;
     // ORIGINAL: wire [46:0] aud_prod_q16 = disc_rel * spf_q16;
-    wire [46:0] aud_prod_q16   = disc_rel_aud * spf_q16;
-    wire [31:0] aud_target_lba = aud_lba_start + {8'd0, aud_prod_q16[46:23]};
+    // TIMING-PIPE-2026-09-25 original (single-cycle from ld_curr_frame):
+    // wire [46:0] aud_prod_q16   = disc_rel_aud * spf_q16;
+    // wire [31:0] aud_target_lba = aud_lba_start + {8'd0, aud_prod_q16[46:23]};
+    reg  [16:0] disc_rel_q = 17'd0, disc_rel_aud_q = 17'd0;
+    reg  [46:0] aud_prod_r = 47'd0;
+    reg  [31:0] aud_target_lba_r = 32'd0;
+    always @(posedge clk) begin
+        disc_rel_q       <= disc_rel;
+        disc_rel_aud_q   <= disc_rel_aud;
+        aud_prod_r       <= disc_rel_aud_q * spf_q16;
+        aud_target_lba_r <= aud_lba_start + {8'd0, aud_prod_r[46:23]};
+    end
+    wire [31:0] aud_target_lba = aud_target_lba_r;
 
     // VIDEO-RATIO-2026-07-05: real ratio applied (was a 1:1 placeholder). video_frame =
     // round(disc_rel * mpeg_fpks / DISC_FPKS). mpeg_fpks is header@24 (this capture's true
@@ -687,8 +734,11 @@ module dlv_streamer #(
     // wire [33:0] vid_prod   = (disc_rel * mpeg_fpks_17) + (DISC_FPKS >> 1);
     // wire [33:0] vid_scaled = vid_prod / DISC_FPKS;
     // wire [16:0] vid_ratio  = vid_scaled[16:0];
-    wire [16:0] vid_ratio  = disc_rel;                       // 1:1, per Daphne's framefile
-    wire [16:0] vid_target = (vid_ratio >= frame_count[16:0]) ? (frame_count[16:0] - 17'd1) : vid_ratio;
+    wire [16:0] vid_ratio  = disc_rel_q;                     // 1:1, per Daphne's framefile (TIMING-PIPE-2026-09-25: was disc_rel)
+    // TIMING-PIPE-2026-09-25 original: wire [16:0] vid_target = (vid_ratio >= frame_count[16:0]) ? (frame_count[16:0] - 17'd1) : vid_ratio;
+    reg  [16:0] vid_target_r = 17'd0;
+    always @(posedge clk) vid_target_r <= (vid_ratio >= frame_count[16:0]) ? (frame_count[16:0] - 17'd1) : vid_ratio;
+    wire [16:0] vid_target = vid_target_r;
 
     // FETCH-PHASE-LOCK-2026-07-25: 1-cycle pulse when the mapped frame changes. Declared up with the
     // pacer regs; driven here, where vid_target exists. Delete this block to revert.
@@ -697,19 +747,25 @@ module dlv_streamer #(
             vid_target_q <= {17{1'b1}};
             vid_chg      <= 1'b0;
         end else begin
-            vid_target_q <= vid_target;
-            vid_chg      <= (vid_target != vid_target_q);
+            // TIMING-PIPE-2026-09-25 original (every cycle):
+            // vid_target_q <= vid_target;
+            // vid_chg      <= (vid_target != vid_target_q);
+            // Only once the target has settled, so the pulse lands when the fetch is allowed.
+            vid_chg      <= tgt_ok && (vid_target != vid_target_q);
+            if (tgt_ok) vid_target_q <= vid_target;
         end
     end
 
     // SEARCH-sized jump detect: PLAY advances +1/frame -> no jump; SEARCH ramps in big steps -> jump.
     reg  [16:0] prev_ld;
-    always @(posedge clk) prev_ld <= ld_curr_frame;
-    wire [16:0] fdiff  = (ld_curr_frame > prev_ld) ? (ld_curr_frame - prev_ld) : (prev_ld - ld_curr_frame);
+    // TIMING-PIPE-2026-09-25 original: prev_ld <= ld_curr_frame; fdiff from ld_curr_frame
+    always @(posedge clk) prev_ld <= ld_q;
+    wire [16:0] fdiff  = (ld_q > prev_ld) ? (ld_q - prev_ld) : (prev_ld - ld_q);
     wire        jump_w = (fdiff > 17'd16);
 
     reg  seek_req;
-    wire seek_consume = (state == S_READY) && header_valid && seek_req;
+    // TIMING-PIPE-2026-09-25 original: wire seek_consume = (state == S_READY) && header_valid && seek_req;
+    wire seek_consume = (state == S_READY) && header_valid && seek_req && tgt_ok;
     // SEEK-REQ-RACE-FIX-2026-07-16: original two-if body commented below, uncomment to revert.
     // BUG: both ifs are in ONE always block, so when jump_w and seek_consume coincide the LAST
     // assignment wins and seek_req <= 1'b0 -- the jump is SILENTLY LOST and the audio never
@@ -734,7 +790,8 @@ module dlv_streamer #(
     // frame change after (= the land). seek_armed is set ONLY by the command, so normal per-frame
     // play advances never trigger it.
     reg  seek_armed;
-    wire jump_any = (ld_curr_frame != prev_ld);
+    // TIMING-PIPE-2026-09-25 original: wire jump_any = (ld_curr_frame != prev_ld);
+    wire jump_any = (ld_q != prev_ld);
     always @(posedge clk) begin
         if (reset) begin
             seek_req   <= 1'b0;
@@ -778,6 +835,7 @@ module dlv_streamer #(
             sd_rd <= 1'b0; sd_lba <= 32'd0; sd_blk_cnt <= 6'd0;
             out_valid <= 1'b0; out_last <= 1'b0;
             header_valid <= 1'b0; frame_fetch <= 1'b0;
+            blit_ack <= blit_req; fetch_blit <= 1'b0; blit_start <= 1'b0; tape_frames <= 17'd0; tape_frames_hdr <= 17'd0;
             // DLV-V2-2026-07-24: 0 => "absent", so a v1 image deterministically takes the
             // samp_per_frame fallback instead of powering up on an undefined value.
             spf_q16_hdr  <= 32'd0;
@@ -791,13 +849,13 @@ module dlv_streamer #(
             // compute to 0 at boot.
             last_fetched_frame <= {17{1'b1}};
             // WEDGE-WATCHDOG-2026-07-24
-            wd_cnt <= 24'd0; wd_rst_cnt <= 4'd0;
+            wd_cnt <= 28'd0; wd_rst_cnt <= 4'd0;
             wd_state <= 4'd0; wd_frame <= 17'd0; wd_trips <= 16'd0;
         end else begin
             // WEDGE-WATCHDOG-2026-07-24: run the timer BEFORE the case, so a state change or a
             // progress event inside the case re-arms it on the NEXT cycle rather than this one.
-            if (!wd_arm || wd_prog)     wd_cnt <= 24'd0;
-            else if (wd_cnt != WD_LIMIT) wd_cnt <= wd_cnt + 24'd1;
+            if (!wd_arm || wd_prog)     wd_cnt <= 28'd0;
+            else if (wd_cnt != wd_lim)   wd_cnt <= wd_cnt + 28'd1;
             if (wd_rst_cnt != 4'd0)      wd_rst_cnt <= wd_rst_cnt - 4'd1;
 
             case (state)
@@ -805,7 +863,7 @@ module dlv_streamer #(
             S_IDLE: begin
                 if (img_mounted && img_size != 0) begin
                     cap_mode <= 2'd0; cur_sec <= 32'd0; ret_state <= S_READY;
-                    header_valid <= 1'b0;
+                    header_valid <= 1'b0; tape_frames <= 17'd0;
                     state <= S_RD_ISSUE;
                 end
             end
@@ -813,6 +871,7 @@ module dlv_streamer #(
             // ---- arbiter/idle: keep audio full; fetch a frame on the 30 fps tick ----
             S_READY: begin
                 frame_fetch <= 1'b0;
+                blit_start  <= 1'b0;
                 // FRAME-TICK-SWALLOW-FIX-2026-07-24: the audio re-point does NOT change `state` and
                 // does NOT consume the SD port -- it is a single aud_lba assignment.  Sitting in the
                 // else-if chain it nonetheless BLOCKED the video-fetch branch for that cycle while
@@ -821,12 +880,14 @@ module dlv_streamer #(
                 // chain: it now runs alongside, and the header-init branch below still overrides
                 // aud_lba on a coincident cycle (later assignment wins), as before.
                 // Original position: `end else if (seek_req) begin <this line> end else if (img_...`
-                if (header_valid && seek_req)
+                // TIMING-PIPE-2026-09-25 original: if (header_valid && seek_req)
+                if (seek_consume)
                     aud_lba <= (aud_target_lba >= aud_lba_end) ? (aud_lba_end - 32'd1) : aud_target_lba;
 
                 if (!header_valid) begin
                     // one-time init once the header sector has been latched
                     header_valid  <= 1'b1;
+                    tape_frames   <= tape_frames_hdr;   // publish only once the whole header is in
                     aud_lba       <= aud_off  >> 9;
                     aud_lba_start <= aud_off  >> 9;
                     aud_lba_end   <= (aud_off + aud_size) >> 9;
@@ -843,19 +904,30 @@ module dlv_streamer #(
                 end else if (img_mounted && img_size != 0) begin
                     // re-mount: re-read header
                     cap_mode <= 2'd0; cur_sec <= 32'd0; ret_state <= S_READY;
-                    header_valid <= 1'b0;
+                    header_valid <= 1'b0; tape_frames <= 17'd0;
                     state <= S_RD_ISSUE;
-                end else if (frame_pending && (aud_level >= FILL_LOW)) begin
+                end else if (blit_go) begin   // BLIT-PRIORITY-2026-09-25 (was the condition below, now a wire)
+                    // original: end else if ((blit_req != blit_ack) && dec_idle && !blit_hold && (aud_level >= FILL_LOW)) begin
+                    // ---- asset blit: decoder idle, audio comfortable ----
+                    frame_fetch <= 1'b1;
+                    cur_frame   <= blit_frame;
+                    fetch_blit  <= 1'b1;
+                    blit_start  <= 1'b1;
+                    blit_ack    <= blit_req;
+                    state <= S_IDX;
+                end else if (frame_pending && (aud_level >= FILL_LOW) && !blit_hold) begin
                     // REDUNDANT-REDRAW-FIX-2026-07-15: only actually fetch/decode/write if the
                     // mapped mjpeg frame has genuinely changed since the last one we drew. frame_
                     // pending still clears every tick regardless (frame_start, below, doesn't
                     // depend on this check) -- ticks where the content hasn't changed just do
                     // nothing instead of redundantly redrawing identical pixels.
-                    if (vid_target != last_fetched_frame) begin
+                    // TIMING-PIPE-2026-09-25 original: if (vid_target != last_fetched_frame) begin
+                    if (tgt_ok && (vid_target != last_fetched_frame)) begin
                         // ---- start a video frame fetch (audio comfortable) ----
                         frame_fetch        <= 1'b1;      // decoder held in reset through the fetch
                         cur_frame          <= vid_target;   // HLE-DRIVE: fetch the mapped mjpeg frame
                         last_fetched_frame <= vid_target;
+                        fetch_blit         <= 1'b0;
                         state <= S_IDX;
                     end
                 end else if (aud_level < FILL_HIGH) begin
@@ -947,6 +1019,9 @@ module dlv_streamer #(
                         9'd97:  spf_q16_hdr[15:8]  <= sd_buff_dout;
                         9'd98:  spf_q16_hdr[23:16] <= sd_buff_dout;
                         9'd99:  spf_q16_hdr[31:24] <= sd_buff_dout;
+                        9'd24: tape_frames_hdr[7:0]  <= sd_buff_dout;   // asset frames start here
+                        9'd25: tape_frames_hdr[15:8] <= sd_buff_dout;
+                        9'd26: tape_frames_hdr[16]   <= sd_buff_dout[0];
                         9'd28: ld_leader_off[7:0]  <= sd_buff_dout;   // HEADER-FIELDS-2026-07-05
                         9'd29: ld_leader_off[15:8] <= sd_buff_dout;
                         9'd30: ld_leader_off[23:16]<= sd_buff_dout;
@@ -1016,9 +1091,9 @@ module dlv_streamer #(
             // the decoder, so pulsing it here would only double-drive the same reset.
             if (wd_fire) begin
                 wd_state  <= state;
-                wd_frame  <= ld_curr_frame;
+                wd_frame  <= ld_q;   // TIMING-PIPE-2026-09-25 was ld_curr_frame
                 wd_trips  <= wd_trips + 16'd1;
-                wd_cnt    <= 24'd0;
+                wd_cnt    <= 28'd0;
                 wd_rst_cnt<= 4'd15;
                 sd_rd     <= 1'b0;
                 out_valid <= 1'b0;

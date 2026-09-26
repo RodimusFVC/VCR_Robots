@@ -215,7 +215,8 @@ module jpeg_frame_decoder
     //------------------------------------------------------------------------
     // core_jpeg instance  (fixed standard Huffman tables)
     //------------------------------------------------------------------------
-    jpeg_core #(.SUPPORT_WRITABLE_DHT(0)) u_jpeg
+    // Tape frames carry the standard tables, the appended assets carry optimised ones: load per frame.
+    jpeg_core #(.SUPPORT_WRITABLE_DHT(1)) u_jpeg
     (
         .clk_i           (clk),
         .rst_i           (rst),

@@ -34,7 +34,8 @@ module fb_writer #(
     // WRITE-COALESCE-2026-07-24 isolation switch. 1 = merge the 4 halfwords sharing a 64-bit DDR
     // word (19,200 writes/frame). 0 = one write per pixel, EXACTLY the prior behaviour (76,800),
     // with no code removed -- so a bad HW result is attributable by flipping this, not by reverting.
-    parameter        COALESCE       = 1'b1
+    parameter        COALESCE       = 1'b1,
+    parameter [15:0] PANEL_STRIDE   = 16'd960    // halfwords per row of the panel buffer (asset blits)
 )(
     input             clk,          // DDRAM_CLK domain
     input             reset,        // active-high
@@ -44,6 +45,13 @@ module fb_writer #(
     // Arcade-DragonsLair.sv fb_buf_sel) instead of writing into the same buffer the raster reader
     // is scanning out of.
     input      [26:0] base_hw,
+
+    // Asset blit: panel=1 writes with PANEL_STRIDE, clipped to clip_w x clip_h (the decoded
+    // image's real size -- the decoder emits whole 16x16 MCUs). panel=0 = video framebuffer.
+    input             panel,
+    input             half,         // panel only: keep even x/y, write at (x/2, y/2) -- 2:1 thumbnail
+    input      [15:0] clip_w,       // clip in SOURCE pixels
+    input      [15:0] clip_h,
 
     // WRITE-GATE-2026-07-16 (new port, no original to restore -- delete on revert): from
     // fb_raster_reader.fill_idle.  High = the raster reader's line fetch has landed and it is not
@@ -128,12 +136,47 @@ module fb_writer #(
     // sim-vs-synthesis divergence on this project), so declaration order here is load-bearing.
 
     // halfword index = base_hw + y*STRIDE_HW + x
-    wire [26:0] hw_index = base_hw + (px_y * STRIDE_HW) + {11'd0, px_x};
+    // Original: wire [26:0] hw_index = base_hw + (px_y * STRIDE_HW) + {11'd0, px_x};
+    wire        dec2     = panel & half;
+    wire [15:0] ox       = dec2 ? {1'b0, px_x[15:1]} : px_x;
+    wire [15:0] oy       = dec2 ? {1'b0, px_y[15:1]} : px_y;
+    // Original (2:1 point sample): wire keep = !dec2 || (!px_x[0] && !px_y[0]);
+    wire        keep     = !dec2 || (px_x[0] && px_y[0]);   // half: write the 2x2 average at its odd/odd pixel
+    wire [26:0] row_off  = panel ? (oy * PANEL_STRIDE) : (oy * STRIDE_HW);
+    wire [26:0] hw_index = base_hw + row_off + {11'd0, ox};
 
     // WRITE-STAGE-A-2026-07-20: named wires -- Quartus 17 elaborates .v as Verilog-2001, where a
     // bit-select of an EXPRESSION, e.g. (base_hw+clear_idx)[1:0], is illegal (error 10170).
     wire [26:0] clear_addr = base_hw + clear_idx;
-    wire [15:0] px565      = {px_r[7:3], px_g[7:2], px_b[7:3]};
+    // Half-size blits: 2x2 box average. core_jpeg emits 8x8 blocks row by row, so a pixel pair is
+    // consecutive and the row pair below arrives later in the same block; even-row pair sums wait in
+    // a 4-entry buffer tagged {block x, row pair}. A tag miss falls back to the horizontal average.
+    reg   [7:0] h0_r, h0_g, h0_b;
+    reg  [15:0] h0_x, h0_y;
+    reg  [26:0] vs_sum [0:3];
+    reg  [27:0] vs_tag [0:3];
+    wire        h_pair = (h0_x == {px_x[15:1], 1'b0}) && (h0_y == px_y);
+    wire  [8:0] hs_r   = h_pair ? ({1'b0, h0_r} + {1'b0, px_r}) : {px_r, 1'b0};
+    wire  [8:0] hs_g   = h_pair ? ({1'b0, h0_g} + {1'b0, px_g}) : {px_g, 1'b0};
+    wire  [8:0] hs_b   = h_pair ? ({1'b0, h0_b} + {1'b0, px_b}) : {px_b, 1'b0};
+    wire  [1:0] vs_slot = px_x[2:1];
+    wire [27:0] vs_key  = {px_x[15:3], px_y[15:1]};
+    wire [26:0] vs_old  = vs_sum[vs_slot];
+    wire        v_pair  = (vs_tag[vs_slot] == vs_key);
+    wire  [9:0] av_r   = v_pair ? ({1'b0, vs_old[26:18]} + {1'b0, hs_r}) : {hs_r, 1'b0};
+    wire  [9:0] av_g   = v_pair ? ({1'b0, vs_old[17:9]}  + {1'b0, hs_g}) : {hs_g, 1'b0};
+    wire  [9:0] av_b   = v_pair ? ({1'b0, vs_old[8:0]}   + {1'b0, hs_b}) : {hs_b, 1'b0};
+    always @(posedge clk) begin
+        if (px_we && dec2 && !px_x[0]) begin
+            h0_r <= px_r; h0_g <= px_g; h0_b <= px_b; h0_x <= px_x; h0_y <= px_y;
+        end
+        if (px_we && dec2 && px_x[0] && !px_y[0]) begin
+            vs_sum[vs_slot] <= {hs_r, hs_g, hs_b};
+            vs_tag[vs_slot] <= vs_key;
+        end
+    end
+    // Original: wire [15:0] px565 = {px_r[7:3], px_g[7:2], px_b[7:3]};
+    wire [15:0] px565      = dec2 ? {av_r[9:5], av_g[9:4], av_b[9:5]} : {px_r[7:3], px_g[7:2], px_b[7:3]};
     // byte enables for one halfword: 2 lanes, selected by the halfword's position in the 64-bit
     // word. Identical to ddram's old `8'd3<<{wraddr[2:1],1'b0}` because wraddr[2:1] == addr[1:0].
     wire  [7:0] be_pix     = 8'd3 << {hw_index[1:0],   1'b0};
@@ -153,7 +196,12 @@ module fb_writer #(
     // Why every previous fix missed it: triple buffering, read coalescing and write batching all
     // change TIMING/BANDWIDTH; this is an ADDRESS-RANGE bug and none of them touch it.
     // Clipping here (rather than in core_jpeg) keeps the third-party decoder untouched.
-    wire in_range = (px_x < FB_COLS) && (px_y < FB_ROWS);
+    // Original: wire in_range = (px_x < FB_COLS) && (px_y < FB_ROWS);
+    // Original: wire in_range = panel ? ((px_x < clip_w) && (px_y < clip_h) && keep) : ...
+    // half: clip on the pair's EVEN coordinate, so an odd-width image keeps its last column
+    wire [15:0] clip_x = dec2 ? {px_x[15:1], 1'b0} : px_x;
+    wire [15:0] clip_y = dec2 ? {px_y[15:1], 1'b0} : px_y;
+    wire in_range = panel ? ((clip_x < clip_w) && (clip_y < clip_h) && keep) : ((px_x < FB_COLS) && (px_y < FB_ROWS));
 
     // ---- WRITE-COALESCE-2026-07-24 (5th attempt) ---------------------------------------------
     // 76,800 single-halfword DDR writes per frame, each a serialised we_req/we_ack round trip, is

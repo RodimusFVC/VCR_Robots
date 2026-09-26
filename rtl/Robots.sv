@@ -100,7 +100,29 @@ module Robots #(
     // strip when it falls. cards_revealed_o is the sticky set for that strip.
     output            card_show_o,
     output      [2:0] card_id_o,        // 0..5 = card A..F
-    output      [5:0] cards_revealed_o
+    output      [5:0] cards_revealed_o,
+
+    // Game state for the panel renderer (menus, card thumbnails).
+    output      [1:0] phase_o,          // 0 = skill menu, 1 = card-mode menu, 2 = playing
+    output      [1:0] packet_o,         // 0 Beginner .. 3 Expert
+    output            pick_mode_o,      // 0 = random cards, 1 = player picks
+    output      [5:0] seed_o,           // drawn side of each card (bit k = card k)
+
+    // Card moment: the video is covered while a clue card is presented.
+    output      [1:0] cm_o,             // 0 none, 1 choose a face, 2 card zoomed
+    output      [2:0] cm_card_o,        // 0..5 = card A..F being presented
+    output            cm_sel_o,         // choose: face under the cursor (0 = the 0 face)
+
+    // Panel cursor and study views.
+    output      [4:0] focus_o,          // 0 video, 1 Map, 2 Suspects, 3..8 card A..F, 9..19 suspect 0..10, 20..23 endgame buttons
+    output      [2:0] view_o,           // 0 none, 1 map, 2 leaflet, 3 answer, 4 notebook, 5 game assets, 6 clue card zoom
+    output      [3:0] gal_o,            // game assets: item shown (0..8)
+
+    // Endgame.
+    output      [1:0] eg_o,             // 0 play, 1 accusation hold, 2 verdict (credits roll), 3 end
+    output            armed_o,          // accusation: the suspect under the cursor is armed (A again convicts)
+    output            win_o,            // verdict: the accused is the culprit
+    output      [4:0] page_o            // answer / notebook page for this game (A=0 .. FF=31)
 );
 
     //------------------------------------------------------------------------
@@ -130,14 +152,21 @@ module Robots #(
     wire btn_seek_n = p1[7];            // R -> seek to next index
 
     // Edge-detect everything so a held button acts once, not every clock.
-    reg  start_q, select_q, a_q, b_q, left_q, right_q, seekp_q, seekn_q;
+    reg  start_q, select_q, a_q, b_q, left_q, right_q, seekp_q, seekn_q, up_q, down_q;
     wire start_edge   = btn_start  & ~start_q;
     wire restart_edge = btn_select & ~select_q;
     wire a_edge       = btn_a      & ~a_q;
     wire b_edge       = btn_b      & ~b_q;
     wire move_edge    = (btn_left  & ~left_q) | (btn_right & ~right_q);
+    // menu lists: Up/Left = previous choice, Down/Right = next choice
+    wire prev_edge    = (btn_up    & ~up_q)   | (btn_left  & ~left_q);
+    wire next_edge    = (btn_down  & ~down_q) | (btn_right & ~right_q);
     wire seekp_edge   = btn_seek_p & ~seekp_q;
     wire seekn_edge   = btn_seek_n & ~seekn_q;
+    wire up_e         = btn_up    & ~up_q;
+    wire down_e       = btn_down  & ~down_q;
+    wire left_e       = btn_left  & ~left_q;
+    wire right_e      = btn_right & ~right_q;
 
     always @(posedge clk_sys) begin
         if (!reset) begin
@@ -145,11 +174,13 @@ module Robots #(
             a_q      <= 1'b0;  b_q      <= 1'b0;
             left_q   <= 1'b0;  right_q  <= 1'b0;
             seekp_q  <= 1'b0;  seekn_q  <= 1'b0;
+            up_q     <= 1'b0;  down_q   <= 1'b0;
         end else begin
             start_q  <= btn_start;  select_q <= btn_select;
             a_q      <= btn_a;      b_q      <= btn_b;
             left_q   <= btn_left;   right_q  <= btn_right;
             seekp_q  <= btn_seek_p; seekn_q  <= btn_seek_n;
+            up_q     <= btn_up;     down_q   <= btn_down;
         end
     end
 
@@ -164,6 +195,20 @@ module Robots #(
     reg  [16:0] frame_ctr;
     reg  [31:0] film_div;
     reg   [5:0] cards;                  // sticky: card A..F has been revealed
+    // Study views hold the tape like a modal (declared here for the same reason).
+    reg   [2:0] view;                   // 0 none, 1 map, 2 leaflet, 3 answer, 4 notebook, 5 game assets, 6 clue zoom
+    reg   [4:0] focus;                  // see focus_o
+    reg         panel_live;             // the panel buttons exist once a game's first card moment starts
+    wire        view_open = (view != 3'd0);
+    // Endgame (2026-09-25): hold at the end of Game Part 8 for the accusation, then credits, then end.
+    localparam [1:0] EG_PLAY = 2'd0, EG_ACCUSE = 2'd1, EG_VERDICT = 2'd2, EG_END = 2'd3;
+    reg   [1:0] eg;
+    reg         armed;                  // first A on a suspect arms, a second A on the same one convicts
+    reg   [3:0] accused;
+    reg         win;
+    reg   [3:0] gal;                    // game assets item
+    reg         play_again_q;           // Play Again = the confirmed restart
+    wire        eg_hold = (eg == EG_ACCUSE);
 
     //------------------------------------------------------------------------
     // MODAL UI LAYER (2026-08-15)
@@ -198,7 +243,8 @@ module Robots #(
     // In a two-option prompt, left and right both just toggle: there is nowhere
     // else to go, and it means the player cannot get lost holding one direction.
     wire ui_open    = ~ui_modal & restart_edge;
-    wire do_restart = (ui_state == UI_RESTART) & a_edge &  confirm_sel;   // "Yes"
+    // Original: wire do_restart = (ui_state == UI_RESTART) & a_edge &  confirm_sel;
+    wire do_restart = ((ui_state == UI_RESTART) & a_edge &  confirm_sel) | play_again_q;   // "Yes" or Play Again
     wire do_cancel  = (ui_state == UI_RESTART) & (b_edge | (a_edge & ~confirm_sel));
 
     always @(posedge clk_sys) begin
@@ -227,7 +273,8 @@ module Robots #(
     // own pause, the MiSTer system pause, the video pipeline, or an open modal.
     // All four freeze the COUNTER rather than the tick, so the film cadence keeps
     // its phase across a hold however long it lasts.
-    wire        frame_adv = film_tick & playing & ~pause & ~disc_hold & ~ui_modal
+    // Original: wire frame_adv = film_tick & playing & ~pause & ~disc_hold & ~ui_modal
+    wire        frame_adv = film_tick & playing & ~pause & ~disc_hold & ~ui_modal & ~view_open & ~eg_hold
                             & (phase == G_PLAY)
                             & ~(at_end & HOLD_AT_END);
 
@@ -248,6 +295,20 @@ module Robots #(
     localparam [1:0] G_SKILL = 2'd0, G_CARDMODE = 2'd1, G_PLAY = 2'd2;
 
     reg  [1:0] phase;
+    wire       game_start = (phase == G_CARDMODE) & a_edge & ~do_restart;   // the card-mode choice was just confirmed
+
+    // Card moment (declared here: the phase and transport blocks below both read it).
+    // Entering an unrevealed Clue Card segment covers the video and presents the card:
+    //   CM_PICK  player-picks mode, face not chosen yet: both faces, Left/Right + A
+    //   CM_ZOOM  the card's face, full size; B backs out -> card to its slot, tape jumps on
+    // The tape keeps rolling for the segment's audio but holds on its last frame.
+    localparam [1:0] CM_NONE = 2'd0, CM_PICK = 2'd1, CM_ZOOM = 2'd2;
+    reg  [1:0] cm = 2'd0;
+    reg        cm_sel = 1'b0;
+    reg  [2:0] cm_card = 3'd0;
+    wire       cm_active   = (cm != CM_NONE);
+    wire       cm_confirm  = (cm == CM_PICK) & a_edge;        // face chosen
+    wire       cm_backout  = (cm == CM_ZOOM) & b_edge;        // done with the card
     reg  [1:0] packet;          // 0=Beginner 1=Intermediate 2=Advanced 3=Expert
     reg        pick_mode;       // 0 = random cards, 1 = player picks
     reg  [5:0] seed;            // card side bitmask == GAME NUMBER 0..63
@@ -270,12 +331,15 @@ module Robots #(
             seed  <= 6'd0;     card_known <= 6'd0;
         end else case (phase)
             G_SKILL: begin
-                if (btn_left  & ~left_q)  packet <= packet - 2'd1;
-                if (btn_right & ~right_q) packet <= packet + 2'd1;
+                // Original: Left/Right wrapped through the packets.
+                if (prev_edge && packet != 2'd0) packet <= packet - 2'd1;
+                if (next_edge && packet != 2'd3) packet <= packet + 2'd1;
                 if (a_edge) phase <= G_CARDMODE;
             end
             G_CARDMODE: begin
-                if (move_edge) pick_mode <= ~pick_mode;
+                // Original: if (move_edge) pick_mode <= ~pick_mode;
+                if (prev_edge) pick_mode <= 1'b0;             // Random (top)
+                if (next_edge) pick_mode <= 1'b1;             // Choose (bottom)
                 if (b_edge)    phase <= G_SKILL;          // back
                 if (a_edge) begin
                     phase <= G_PLAY;
@@ -289,12 +353,11 @@ module Robots #(
                 end
             end
             default: begin
-                // Player-picks: a card resolves the moment its segment is entered.
-                // (Which SIDE is a UI choice; until that screen exists, take the
-                // LFSR bit so the transport is exercisable end to end.)
-                if (pick_mode & card_show & ~card_known[card_id]) begin
-                    card_known[card_id] <= 1'b1;
-                    seed[card_id]       <= lfsr[0];
+                // Player-picks: the face chosen on the card-moment screen.
+                // Original placeholder: on entering the segment, seed[card_id] <= lfsr[0].
+                if (cm_confirm) begin
+                    card_known[cm_card] <= 1'b1;
+                    seed[cm_card]       <= cm_sel;
                 end
             end
         endcase
@@ -351,7 +414,9 @@ module Robots #(
                        !known[3] ? 6'd14 : !known[4] ? 6'd16 : !known[5] ? 6'd18 :
                                                                           6'd63;
     endfunction
-    wire [5:0] seek_cap = seek_ceiling(card_known);
+    // Original: seek_ceiling(card_known) -- random mode knew every card at boot, so never bound.
+    // Now: R stops ON the next card not yet shown, in both modes.
+    wire [5:0] seek_cap = seek_ceiling(cards);
 
     //------------------------------------------------------------------------
     // SEGMENT INDEX + SEEK  (2026-08-15)  L = prior index, R = next index.
@@ -474,7 +539,10 @@ module Robots #(
     // Never let a forward seek land beyond an unresolved clue.
     wire [5:0] seek_idx  = (seek_want > seek_cap) ? seek_cap : seek_want;
 
-    wire       do_seek  = (seekp_edge | seekn_edge) & ~ui_modal;
+    wire       do_seek  = (seekp_edge | seekn_edge) & ~ui_modal & ~cm_active & ~view_open
+                        & ~(eg == EG_ACCUSE & seekn_edge) & ~(eg == EG_VERDICT) & ~(eg == EG_END);
+    wire       seek_acc = do_seek & (seek_idx > 6'd19) & (eg == EG_PLAY);   // never past the accusation
+    wire       at_acc   = (idx == 6'd19) && (frame_ctr + 17'd1 >= index_frame(6'd20));
 
     //---- automatic disposition handling ------------------------------------
     wire [1:0] disp_now  = index_disp(idx);
@@ -490,13 +558,189 @@ module Robots #(
     wire       card_show = (disp_now == D_CARD);
     wire [2:0] card_id   = (idx >= 6'd8) ? (idx[3:1] - 3'd4) : 3'd0;
 
+    // Card moment FSM (regs declared with the phase regs above).
+    always @(posedge clk_sys) begin
+        if (!reset || do_restart) begin
+            cm <= CM_NONE;  cm_sel <= 1'b0;  cm_card <= 3'd0;
+        end else case (cm)
+            CM_NONE:
+                if (phase == G_PLAY && card_show && !cards[card_id] && !view_open) begin
+                    cm_card <= card_id;
+                    cm_sel  <= 1'b0;
+                    cm      <= (pick_mode && !card_known[card_id]) ? CM_PICK : CM_ZOOM;
+                end
+            CM_PICK: begin
+                if (prev_edge) cm_sel <= 1'b0;
+                if (next_edge) cm_sel <= 1'b1;
+                if (a_edge)    cm     <= CM_ZOOM;
+            end
+            CM_ZOOM:
+                if (b_edge) cm <= CM_NONE;
+            default: cm <= CM_NONE;
+        endcase
+    end
+    // Roll the clue segment for its audio, but never past its last frame.
+    wire       cm_hold  = cm_active && (idx + 6'd1 < N_INDEX) && (frame_ctr + 17'd1 >= index_frame(idx + 6'd1));
+    // Original: wire adv = frame_adv & ~cm_hold;
+    wire       adv      = frame_adv & ~cm_hold & ~(at_acc & (eg == EG_PLAY) & (phase == G_PLAY));   // stop on Game Part 8's last frame
+
+    //------------------------------------------------------------------------
+    // PANEL CURSOR, VIEWS AND ENDGAME (2026-09-25)
+    //   play    : Right from the video enters the panel; D-pad over Map|Suspects / cards A B C / D E F
+    //             (revealed only). A on a button opens its view, on a card zooms it. B, or Left off
+    //             column 0, returns to the cursor's home (the video).
+    //   accuse  : held on Game Part 8's last frame; home is the suspect list (9..19). A arms, a second
+    //             A on the same suspect convicts; B or any move disarms. L rewinds to review.
+    //   verdict : credits roll; Full Answer (20) | Baley's Notes (21). End adds Play Again (22) |
+    //             Game Assets (23). R skips the credits.
+    //   Every view (map, leaflet, answer, notebook, game assets, clue zoom) holds the tape until B.
+    //------------------------------------------------------------------------
+    // Page -> culprit, as suspect plate index (0 Han, 1 Vasilia, 2 Amadiro, 3 Baley, 4 Enderby,
+    // 5 Sophia, 6 Daneel, 7 Giskard, 8 Borgraf, 9 Sammy, 10 Jane). Vault: PAGE -> CULPRIT, user-validated.
+    function [3:0] culprit_of(input [4:0] pg);
+        case (pg)
+            5'd0 : culprit_of = 4'd2;   // A
+            5'd1 : culprit_of = 4'd10;   // B
+            5'd2 : culprit_of = 4'd8;   // C
+            5'd3 : culprit_of = 4'd10;   // D
+            5'd4 : culprit_of = 4'd5;   // E
+            5'd5 : culprit_of = 4'd8;   // F
+            5'd6 : culprit_of = 4'd10;   // G
+            5'd7 : culprit_of = 4'd8;   // H
+            5'd8 : culprit_of = 4'd5;   // I
+            5'd9 : culprit_of = 4'd5;   // J
+            5'd10: culprit_of = 4'd5;   // K
+            5'd11: culprit_of = 4'd2;   // L
+            5'd12: culprit_of = 4'd9;   // M
+            5'd13: culprit_of = 4'd4;   // N
+            5'd14: culprit_of = 4'd8;   // O
+            5'd15: culprit_of = 4'd1;   // P
+            5'd16: culprit_of = 4'd4;   // Q
+            5'd17: culprit_of = 4'd1;   // R
+            5'd18: culprit_of = 4'd9;   // S
+            5'd19: culprit_of = 4'd9;   // T
+            5'd20: culprit_of = 4'd8;   // U
+            5'd21: culprit_of = 4'd9;   // V
+            5'd22: culprit_of = 4'd4;   // W
+            5'd23: culprit_of = 4'd1;   // X
+            5'd24: culprit_of = 4'd2;   // Y
+            5'd25: culprit_of = 4'd10;   // Z
+            5'd26: culprit_of = 4'd1;   // AA
+            5'd27: culprit_of = 4'd8;   // BB
+            5'd28: culprit_of = 4'd4;   // CC
+            5'd29: culprit_of = 4'd8;   // DD
+            5'd30: culprit_of = 4'd8;   // EE
+            5'd31: culprit_of = 4'd2;   // FF
+            default: culprit_of = 4'd0;
+        endcase
+    endfunction
+
+    wire       nav_on  = (phase == G_PLAY) & ~cm_active & ~ui_modal & ~view_open & (panel_live | (eg != EG_PLAY));
+    wire [1:0] f_row   = (focus < 5'd3) ? 2'd0 : (focus < 5'd6) ? 2'd1 : 2'd2;
+    wire [4:0] f_base  = (focus < 5'd3) ? 5'd1 : (focus < 5'd6) ? 5'd3 : 5'd6;
+    wire [4:0] f_off   = focus - f_base;
+    wire [1:0] f_col   = f_off[1:0];
+    function [4:0] grid_cell(input [1:0] r, input [1:0] c);
+        grid_cell = ((r == 2'd0) ? 5'd1 : (r == 2'd1) ? 5'd3 : 5'd6) + {3'd0, c};
+    endfunction
+    function cell_ok(input [1:0] r, input [1:0] c, input [5:0] rev);
+        cell_ok = (r == 2'd0) ? (c <= 2'd1)
+                              : ((c <= 2'd2) && rev[{1'b0, c} + ((r == 2'd2) ? 3'd3 : 3'd0)]);
+    endfunction
+    wire [1:0] up_col  = (f_row == 2'd1 && f_col > 2'd1) ? 2'd1 : f_col;   // row 0 has two columns
+    wire       sus_on  = (focus >= 5'd9) && (focus <= 5'd19);
+    wire [4:0] sus_k5  = focus - 5'd9;
+    wire [3:0] sus_k   = sus_k5[3:0];
+    wire [4:0] home    = (eg == EG_ACCUSE) ? 5'd9 : 5'd0;
+    wire       do_verdict   = (eg == EG_ACCUSE) & nav_on & sus_on & armed & a_edge;
+    wire       skip_credits = (eg == EG_VERDICT) & seekn_edge & ~ui_modal & ~view_open;
+
+    always @(posedge clk_sys) begin
+        play_again_q <= 1'b0;
+        if (!reset || do_restart) begin
+            view <= 3'd0;  focus <= 5'd0;  panel_live <= 1'b0;
+            eg <= EG_PLAY;  armed <= 1'b0;  accused <= 4'd0;  win <= 1'b0;  gal <= 4'd0;
+        end else begin
+            if (cm_active) begin
+                panel_live <= 1'b1;
+                focus      <= 5'd0;
+            end
+            // endgame phase changes (a rewind out of the hold wins over entering it)
+            if (eg == EG_PLAY && phase == G_PLAY && at_acc && !cm_active) begin
+                eg <= EG_ACCUSE;  focus <= 5'd9;  armed <= 1'b0;
+            end
+            if (eg == EG_ACCUSE && do_seek) begin
+                eg <= EG_PLAY;  focus <= 5'd0;  armed <= 1'b0;
+            end
+            if (do_verdict) begin
+                eg <= EG_VERDICT;  accused <= sus_k;  win <= (culprit_of(page_idx) == sus_k);
+                focus <= 5'd20;  armed <= 1'b0;
+            end
+            if (eg == EG_VERDICT && (skip_credits || idx >= 6'd21)) eg <= EG_END;
+
+            if (view_open) begin
+                if (b_edge) view <= 3'd0;
+                else if (view == 3'd5 && a_edge) gal <= (gal == 4'd8) ? 4'd0 : (gal + 4'd1);
+            end else if (nav_on) begin
+                if (eg == EG_VERDICT || eg == EG_END) begin
+                    // 20 21 / 22 23; the second row exists only at the end
+                    if (a_edge) begin
+                        if (focus == 5'd20) view <= 3'd3;
+                        if (focus == 5'd21) view <= 3'd4;
+                        if (focus == 5'd22) play_again_q <= 1'b1;
+                        if (focus == 5'd23) begin view <= 3'd5; gal <= 4'd0; end
+                    end else if (left_e || right_e) begin
+                        focus <= {focus[4:1], ~focus[0]};
+                    end else if ((up_e || down_e) && eg == EG_END) begin
+                        focus <= focus ^ 5'd2;
+                    end
+                end else if (sus_on) begin
+                    if (a_edge && !armed) armed <= 1'b1;
+                    else if (b_edge || left_e) armed <= 1'b0;
+                    else if (up_e) begin
+                        armed <= 1'b0;  if (focus != 5'd9) focus <= focus - 5'd1;
+                    end else if (down_e) begin
+                        armed <= 1'b0;  if (focus != 5'd19) focus <= focus + 5'd1;
+                    end else if (right_e) begin
+                        armed <= 1'b0;  focus <= 5'd1;
+                    end
+                end else if (focus == 5'd0) begin
+                    if (right_e) focus <= 5'd1;
+                end else if (b_edge) begin
+                    focus <= home;
+                end else if (a_edge) begin
+                    view <= (focus == 5'd1) ? 3'd1 : (focus == 5'd2) ? 3'd2 : 3'd6;   // cards 3..8: zoom
+                end else if (left_e) begin
+                    if (f_col == 2'd0) focus <= home;
+                    else if (cell_ok(f_row, f_col - 2'd1, cards)) focus <= grid_cell(f_row, f_col - 2'd1);
+                end else if (right_e) begin
+                    if (cell_ok(f_row, f_col + 2'd1, cards)) focus <= grid_cell(f_row, f_col + 2'd1);
+                end else if (up_e) begin
+                    if (f_row != 2'd0 && cell_ok(f_row - 2'd1, up_col, cards)) focus <= grid_cell(f_row - 2'd1, up_col);
+                end else if (down_e) begin
+                    if (f_row != 2'd2 && cell_ok(f_row + 2'd1, f_col, cards)) focus <= grid_cell(f_row + 2'd1, f_col);
+                end
+            end
+        end
+    end
+    assign focus_o = focus;
+    assign view_o  = view;
+    assign gal_o   = gal;
+    assign eg_o    = eg;
+    assign armed_o = armed;
+    assign win_o   = win;
+    assign page_o  = page_idx;
+
     // Frame LOAD path -- a discontinuous jump, as opposed to frame_adv's +1.
     // Three users: a confirmed restart, an index seek, and an automatic skip.
     // NOT the clue cards -- those deliberately roll through so the audio survives.
-    wire        frame_load     = do_restart | do_seek | auto_skip;
+    // Original: frame_load = do_restart | do_seek | auto_skip;
+    // Original: frame_load = do_restart | do_seek | auto_skip | cm_backout;  (and no seek_acc / do_verdict terms below)
+    wire        frame_load     = do_restart | do_seek | auto_skip | cm_backout | do_verdict;
     wire [16:0] frame_load_val = do_restart ? index_frame(BOOT_IDX)
-                               : do_seek    ? index_frame(seek_idx)
-                                            : index_frame(idx + 6'd1);
+                               : do_seek    ? (seek_acc ? (index_frame(6'd20) - 17'd1) : index_frame(seek_idx))
+                               : do_verdict ? index_frame(6'd20)                   // the verdict rolls the credits
+                                            : index_frame(idx + 6'd1);   // auto-skip and card back-out: next segment
 
     always @(posedge clk_sys) begin
         if (!reset) begin
@@ -512,7 +756,11 @@ module Robots #(
             // Start is a MANUAL pause and stays available at all times -- except
             // while a modal owns the tape, where obeying it would leave the two
             // disagreeing about who is holding playback.
-            if (~ui_modal & start_edge) playing <= ~playing;
+            if (~ui_modal & ~cm_active & ~view_open & ~eg_hold & start_edge) playing <= ~playing;
+            // Confirming the last menu choice starts the tape: no separate Start press.
+            if (game_start) playing <= 1'b1;
+            if (do_verdict) playing <= 1'b1;
+            if (skip_credits) playing <= 1'b0;
 
             // Confirmed restart lands in exactly the cold-boot state.
             if (do_restart) playing <= 1'b0;
@@ -524,7 +772,7 @@ module Robots #(
 
             if (frame_load)
                 frame_ctr <= frame_load_val;
-            else if (frame_adv)
+            else if (adv)
                 frame_ctr <= at_end ? (HOLD_AT_END ? frame_ctr : 17'd0)
                                     : (frame_ctr + 17'd1);
 
@@ -534,10 +782,12 @@ module Robots #(
             if (do_restart)
                 idx <= BOOT_IDX;
             else if (do_seek)
-                idx <= seek_idx;
-            else if (auto_skip)
+                idx <= seek_acc ? 6'd19 : seek_idx;
+            else if (do_verdict)
+                idx <= 6'd20;
+            else if (auto_skip || cm_backout)
                 idx <= idx + 6'd1;
-            else if (frame_adv && (idx + 6'd1 < N_INDEX)
+            else if (adv && (idx + 6'd1 < N_INDEX)
                                && (frame_ctr + 17'd1 >= index_frame(idx + 6'd1)))
                 idx <= idx + 6'd1;
 
@@ -545,8 +795,9 @@ module Robots #(
             // revealed the moment its segment is entered, so the renderer can
             // draw it full-screen while card_show is high and as a thumbnail
             // afterwards, off one piece of state.
+            // Original: else if (card_show) cards[card_id] <= 1'b1;  (revealed on segment entry)
             if (do_restart) cards <= 6'd0;
-            else if (card_show) cards[card_id] <= 1'b1;
+            else if (cm_backout) cards[cm_card] <= 1'b1;     // revealed once the player is done with it
         end
     end
 
@@ -555,7 +806,8 @@ module Robots #(
     // Audio drain gate. Dropping this on pause silences the ring AND holds its
     // read pointer (dlv_streamer.v:375 aud_muted), which is exactly the
     // freeze-in-place behaviour we want.
-    assign ld_playing_o = playing & ~pause & ~disc_hold & ~ui_modal;
+    // Original: assign ld_playing_o = playing & ~pause & ~disc_hold & ~ui_modal;
+    assign ld_playing_o = playing & ~pause & ~disc_hold & ~ui_modal & ~view_open & ~eg_hold;
 
     assign ui_modal_o       = ui_modal;
     assign ui_confirm_sel_o = confirm_sel;
@@ -563,6 +815,13 @@ module Robots #(
     assign card_show_o      = card_show;
     assign card_id_o        = card_id;
     assign cards_revealed_o = cards;
+    assign phase_o          = phase;
+    assign packet_o         = packet;
+    assign pick_mode_o      = pick_mode;
+    assign seed_o           = seed;
+    assign cm_o             = cm;
+    assign cm_card_o        = cm_card;
+    assign cm_sel_o         = cm_sel;
 
     // A JUMP is the one case where flushing the audio ring IS correct: the ring
     // holds buffered audio for the old position, which must be discarded rather

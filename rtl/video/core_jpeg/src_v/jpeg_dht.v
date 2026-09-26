@@ -71,6 +71,22 @@ localparam DHT_TABLE_CX_AC     = 8'h11;
 generate
 if (SUPPORT_WRITABLE_DHT)
 begin
+    // TIMING-PIPE-2026-09-25: the lookup input comes straight off the bitbuffer's barrel shifter and
+    // failed timing into the width compare and RAM address. Register it on entry; mcu_proc waits for
+    // lookup_valid, so the extra cycle of latency is safe. Original: every *_d below was the *_i port.
+    reg        lookup_req_d;
+    reg [1:0]  lookup_table_d;
+    reg [15:0] lookup_input_d;
+    always @ (posedge clk_i )
+    if (rst_i)
+        lookup_req_d <= 1'b0;
+    else
+        lookup_req_d <= lookup_req_i;
+    always @ (posedge clk_i )
+    begin
+        lookup_table_d <= lookup_table_i;
+        lookup_input_d <= lookup_input_i;
+    end
     reg [15:0] y_dc_min_code_q[0:15];
     reg [15:0] y_dc_max_code_q[0:15];
     reg [9:0]  y_dc_ptr_q[0:15];
@@ -456,35 +472,35 @@ begin
     begin
         y_dc_width_r = 4'b0;
 
-        if ({15'b0, lookup_input_i[15]} < y_dc_max_code_q[0])
+        if ({15'b0, lookup_input_d[15]} < y_dc_max_code_q[0])
             y_dc_width_r = 4'd0;
-        else if ({14'b0, lookup_input_i[15:14]} < y_dc_max_code_q[1])
+        else if ({14'b0, lookup_input_d[15:14]} < y_dc_max_code_q[1])
             y_dc_width_r = 4'd1;
-        else if ({13'b0, lookup_input_i[15:13]} < y_dc_max_code_q[2])
+        else if ({13'b0, lookup_input_d[15:13]} < y_dc_max_code_q[2])
             y_dc_width_r = 4'd2;
-        else if ({12'b0, lookup_input_i[15:12]} < y_dc_max_code_q[3])
+        else if ({12'b0, lookup_input_d[15:12]} < y_dc_max_code_q[3])
             y_dc_width_r = 4'd3;
-        else if ({11'b0, lookup_input_i[15:11]} < y_dc_max_code_q[4])
+        else if ({11'b0, lookup_input_d[15:11]} < y_dc_max_code_q[4])
             y_dc_width_r = 4'd4;
-        else if ({10'b0, lookup_input_i[15:10]} < y_dc_max_code_q[5])
+        else if ({10'b0, lookup_input_d[15:10]} < y_dc_max_code_q[5])
             y_dc_width_r = 4'd5;
-        else if ({9'b0, lookup_input_i[15:9]} < y_dc_max_code_q[6])
+        else if ({9'b0, lookup_input_d[15:9]} < y_dc_max_code_q[6])
             y_dc_width_r = 4'd6;
-        else if ({8'b0, lookup_input_i[15:8]} < y_dc_max_code_q[7])
+        else if ({8'b0, lookup_input_d[15:8]} < y_dc_max_code_q[7])
             y_dc_width_r = 4'd7;
-        else if ({7'b0, lookup_input_i[15:7]} < y_dc_max_code_q[8])
+        else if ({7'b0, lookup_input_d[15:7]} < y_dc_max_code_q[8])
             y_dc_width_r = 4'd8;
-        else if ({6'b0, lookup_input_i[15:6]} < y_dc_max_code_q[9])
+        else if ({6'b0, lookup_input_d[15:6]} < y_dc_max_code_q[9])
             y_dc_width_r = 4'd9;
-        else if ({5'b0, lookup_input_i[15:5]} < y_dc_max_code_q[10])
+        else if ({5'b0, lookup_input_d[15:5]} < y_dc_max_code_q[10])
             y_dc_width_r = 4'd10;
-        else if ({4'b0, lookup_input_i[15:4]} < y_dc_max_code_q[11])
+        else if ({4'b0, lookup_input_d[15:4]} < y_dc_max_code_q[11])
             y_dc_width_r = 4'd11;
-        else if ({3'b0, lookup_input_i[15:3]} < y_dc_max_code_q[12])
+        else if ({3'b0, lookup_input_d[15:3]} < y_dc_max_code_q[12])
             y_dc_width_r = 4'd12;
-        else if ({2'b0, lookup_input_i[15:2]} < y_dc_max_code_q[13])
+        else if ({2'b0, lookup_input_d[15:2]} < y_dc_max_code_q[13])
             y_dc_width_r = 4'd13;
-        else if ({1'b0, lookup_input_i[15:1]} < y_dc_max_code_q[14])
+        else if ({1'b0, lookup_input_d[15:1]} < y_dc_max_code_q[14])
             y_dc_width_r = 4'd14;
         else
             y_dc_width_r = 4'd15;
@@ -495,35 +511,35 @@ begin
     begin
         y_ac_width_r = 4'b0;
 
-        if ({15'b0, lookup_input_i[15]} < y_ac_max_code_q[0])
+        if ({15'b0, lookup_input_d[15]} < y_ac_max_code_q[0])
             y_ac_width_r = 4'd0;
-        else if ({14'b0, lookup_input_i[15:14]} < y_ac_max_code_q[1])
+        else if ({14'b0, lookup_input_d[15:14]} < y_ac_max_code_q[1])
             y_ac_width_r = 4'd1;
-        else if ({13'b0, lookup_input_i[15:13]} < y_ac_max_code_q[2])
+        else if ({13'b0, lookup_input_d[15:13]} < y_ac_max_code_q[2])
             y_ac_width_r = 4'd2;
-        else if ({12'b0, lookup_input_i[15:12]} < y_ac_max_code_q[3])
+        else if ({12'b0, lookup_input_d[15:12]} < y_ac_max_code_q[3])
             y_ac_width_r = 4'd3;
-        else if ({11'b0, lookup_input_i[15:11]} < y_ac_max_code_q[4])
+        else if ({11'b0, lookup_input_d[15:11]} < y_ac_max_code_q[4])
             y_ac_width_r = 4'd4;
-        else if ({10'b0, lookup_input_i[15:10]} < y_ac_max_code_q[5])
+        else if ({10'b0, lookup_input_d[15:10]} < y_ac_max_code_q[5])
             y_ac_width_r = 4'd5;
-        else if ({9'b0, lookup_input_i[15:9]} < y_ac_max_code_q[6])
+        else if ({9'b0, lookup_input_d[15:9]} < y_ac_max_code_q[6])
             y_ac_width_r = 4'd6;
-        else if ({8'b0, lookup_input_i[15:8]} < y_ac_max_code_q[7])
+        else if ({8'b0, lookup_input_d[15:8]} < y_ac_max_code_q[7])
             y_ac_width_r = 4'd7;
-        else if ({7'b0, lookup_input_i[15:7]} < y_ac_max_code_q[8])
+        else if ({7'b0, lookup_input_d[15:7]} < y_ac_max_code_q[8])
             y_ac_width_r = 4'd8;
-        else if ({6'b0, lookup_input_i[15:6]} < y_ac_max_code_q[9])
+        else if ({6'b0, lookup_input_d[15:6]} < y_ac_max_code_q[9])
             y_ac_width_r = 4'd9;
-        else if ({5'b0, lookup_input_i[15:5]} < y_ac_max_code_q[10])
+        else if ({5'b0, lookup_input_d[15:5]} < y_ac_max_code_q[10])
             y_ac_width_r = 4'd10;
-        else if ({4'b0, lookup_input_i[15:4]} < y_ac_max_code_q[11])
+        else if ({4'b0, lookup_input_d[15:4]} < y_ac_max_code_q[11])
             y_ac_width_r = 4'd11;
-        else if ({3'b0, lookup_input_i[15:3]} < y_ac_max_code_q[12])
+        else if ({3'b0, lookup_input_d[15:3]} < y_ac_max_code_q[12])
             y_ac_width_r = 4'd12;
-        else if ({2'b0, lookup_input_i[15:2]} < y_ac_max_code_q[13])
+        else if ({2'b0, lookup_input_d[15:2]} < y_ac_max_code_q[13])
             y_ac_width_r = 4'd13;
-        else if ({1'b0, lookup_input_i[15:1]} < y_ac_max_code_q[14])
+        else if ({1'b0, lookup_input_d[15:1]} < y_ac_max_code_q[14])
             y_ac_width_r = 4'd14;
         else
             y_ac_width_r = 4'd15;
@@ -534,35 +550,35 @@ begin
     begin
         cx_dc_width_r = 4'b0;
 
-        if ({15'b0, lookup_input_i[15]} < cx_dc_max_code_q[0])
+        if ({15'b0, lookup_input_d[15]} < cx_dc_max_code_q[0])
             cx_dc_width_r = 4'd0;
-        else if ({14'b0, lookup_input_i[15:14]} < cx_dc_max_code_q[1])
+        else if ({14'b0, lookup_input_d[15:14]} < cx_dc_max_code_q[1])
             cx_dc_width_r = 4'd1;
-        else if ({13'b0, lookup_input_i[15:13]} < cx_dc_max_code_q[2])
+        else if ({13'b0, lookup_input_d[15:13]} < cx_dc_max_code_q[2])
             cx_dc_width_r = 4'd2;
-        else if ({12'b0, lookup_input_i[15:12]} < cx_dc_max_code_q[3])
+        else if ({12'b0, lookup_input_d[15:12]} < cx_dc_max_code_q[3])
             cx_dc_width_r = 4'd3;
-        else if ({11'b0, lookup_input_i[15:11]} < cx_dc_max_code_q[4])
+        else if ({11'b0, lookup_input_d[15:11]} < cx_dc_max_code_q[4])
             cx_dc_width_r = 4'd4;
-        else if ({10'b0, lookup_input_i[15:10]} < cx_dc_max_code_q[5])
+        else if ({10'b0, lookup_input_d[15:10]} < cx_dc_max_code_q[5])
             cx_dc_width_r = 4'd5;
-        else if ({9'b0, lookup_input_i[15:9]} < cx_dc_max_code_q[6])
+        else if ({9'b0, lookup_input_d[15:9]} < cx_dc_max_code_q[6])
             cx_dc_width_r = 4'd6;
-        else if ({8'b0, lookup_input_i[15:8]} < cx_dc_max_code_q[7])
+        else if ({8'b0, lookup_input_d[15:8]} < cx_dc_max_code_q[7])
             cx_dc_width_r = 4'd7;
-        else if ({7'b0, lookup_input_i[15:7]} < cx_dc_max_code_q[8])
+        else if ({7'b0, lookup_input_d[15:7]} < cx_dc_max_code_q[8])
             cx_dc_width_r = 4'd8;
-        else if ({6'b0, lookup_input_i[15:6]} < cx_dc_max_code_q[9])
+        else if ({6'b0, lookup_input_d[15:6]} < cx_dc_max_code_q[9])
             cx_dc_width_r = 4'd9;
-        else if ({5'b0, lookup_input_i[15:5]} < cx_dc_max_code_q[10])
+        else if ({5'b0, lookup_input_d[15:5]} < cx_dc_max_code_q[10])
             cx_dc_width_r = 4'd10;
-        else if ({4'b0, lookup_input_i[15:4]} < cx_dc_max_code_q[11])
+        else if ({4'b0, lookup_input_d[15:4]} < cx_dc_max_code_q[11])
             cx_dc_width_r = 4'd11;
-        else if ({3'b0, lookup_input_i[15:3]} < cx_dc_max_code_q[12])
+        else if ({3'b0, lookup_input_d[15:3]} < cx_dc_max_code_q[12])
             cx_dc_width_r = 4'd12;
-        else if ({2'b0, lookup_input_i[15:2]} < cx_dc_max_code_q[13])
+        else if ({2'b0, lookup_input_d[15:2]} < cx_dc_max_code_q[13])
             cx_dc_width_r = 4'd13;
-        else if ({1'b0, lookup_input_i[15:1]} < cx_dc_max_code_q[14])
+        else if ({1'b0, lookup_input_d[15:1]} < cx_dc_max_code_q[14])
             cx_dc_width_r = 4'd14;
         else
             cx_dc_width_r = 4'd15;
@@ -573,35 +589,35 @@ begin
     begin
         cx_ac_width_r = 4'b0;
 
-        if ({15'b0, lookup_input_i[15]} < cx_ac_max_code_q[0])
+        if ({15'b0, lookup_input_d[15]} < cx_ac_max_code_q[0])
             cx_ac_width_r = 4'd0;
-        else if ({14'b0, lookup_input_i[15:14]} < cx_ac_max_code_q[1])
+        else if ({14'b0, lookup_input_d[15:14]} < cx_ac_max_code_q[1])
             cx_ac_width_r = 4'd1;
-        else if ({13'b0, lookup_input_i[15:13]} < cx_ac_max_code_q[2])
+        else if ({13'b0, lookup_input_d[15:13]} < cx_ac_max_code_q[2])
             cx_ac_width_r = 4'd2;
-        else if ({12'b0, lookup_input_i[15:12]} < cx_ac_max_code_q[3])
+        else if ({12'b0, lookup_input_d[15:12]} < cx_ac_max_code_q[3])
             cx_ac_width_r = 4'd3;
-        else if ({11'b0, lookup_input_i[15:11]} < cx_ac_max_code_q[4])
+        else if ({11'b0, lookup_input_d[15:11]} < cx_ac_max_code_q[4])
             cx_ac_width_r = 4'd4;
-        else if ({10'b0, lookup_input_i[15:10]} < cx_ac_max_code_q[5])
+        else if ({10'b0, lookup_input_d[15:10]} < cx_ac_max_code_q[5])
             cx_ac_width_r = 4'd5;
-        else if ({9'b0, lookup_input_i[15:9]} < cx_ac_max_code_q[6])
+        else if ({9'b0, lookup_input_d[15:9]} < cx_ac_max_code_q[6])
             cx_ac_width_r = 4'd6;
-        else if ({8'b0, lookup_input_i[15:8]} < cx_ac_max_code_q[7])
+        else if ({8'b0, lookup_input_d[15:8]} < cx_ac_max_code_q[7])
             cx_ac_width_r = 4'd7;
-        else if ({7'b0, lookup_input_i[15:7]} < cx_ac_max_code_q[8])
+        else if ({7'b0, lookup_input_d[15:7]} < cx_ac_max_code_q[8])
             cx_ac_width_r = 4'd8;
-        else if ({6'b0, lookup_input_i[15:6]} < cx_ac_max_code_q[9])
+        else if ({6'b0, lookup_input_d[15:6]} < cx_ac_max_code_q[9])
             cx_ac_width_r = 4'd9;
-        else if ({5'b0, lookup_input_i[15:5]} < cx_ac_max_code_q[10])
+        else if ({5'b0, lookup_input_d[15:5]} < cx_ac_max_code_q[10])
             cx_ac_width_r = 4'd10;
-        else if ({4'b0, lookup_input_i[15:4]} < cx_ac_max_code_q[11])
+        else if ({4'b0, lookup_input_d[15:4]} < cx_ac_max_code_q[11])
             cx_ac_width_r = 4'd11;
-        else if ({3'b0, lookup_input_i[15:3]} < cx_ac_max_code_q[12])
+        else if ({3'b0, lookup_input_d[15:3]} < cx_ac_max_code_q[12])
             cx_ac_width_r = 4'd12;
-        else if ({2'b0, lookup_input_i[15:2]} < cx_ac_max_code_q[13])
+        else if ({2'b0, lookup_input_d[15:2]} < cx_ac_max_code_q[13])
             cx_ac_width_r = 4'd13;
-        else if ({1'b0, lookup_input_i[15:1]} < cx_ac_max_code_q[14])
+        else if ({1'b0, lookup_input_d[15:1]} < cx_ac_max_code_q[14])
             cx_ac_width_r = 4'd14;
         else
             cx_ac_width_r = 4'd15;
@@ -616,7 +632,7 @@ begin
     begin
         lookup_width_r = 4'b0;
 
-        case (lookup_table_i)
+        case (lookup_table_d)
         2'd0:    lookup_width_r = y_dc_width_r;
         2'd1:    lookup_width_r = y_ac_width_r;
         2'd2:    lookup_width_r = cx_dc_width_r;
@@ -638,7 +654,7 @@ begin
     if (rst_i)
         lookup_table_q <= 2'b0;
     else
-        lookup_table_q <= lookup_table_i;
+        lookup_table_q <= lookup_table_d;
 
     //-----------------------------------------------------------------
     // Lookup: Create RAM lookup address
@@ -654,22 +670,22 @@ begin
         case (lookup_table_q)
         2'd0:
         begin
-            input_code_r   = lookup_input_i >> (15 - lookup_width_q);
+            input_code_r   = lookup_input_d >> (15 - lookup_width_q);
             lookup_addr_r  = input_code_r - y_dc_min_code_q[lookup_width_q] + {6'b0, y_dc_ptr_q[lookup_width_q]};
         end
         2'd1:
         begin
-            input_code_r   = lookup_input_i >> (15 - lookup_width_q);
+            input_code_r   = lookup_input_d >> (15 - lookup_width_q);
             lookup_addr_r  = input_code_r - y_ac_min_code_q[lookup_width_q] + {6'b0, y_ac_ptr_q[lookup_width_q]};
         end
         2'd2:
         begin
-            input_code_r   = lookup_input_i >> (15 - lookup_width_q);
+            input_code_r   = lookup_input_d >> (15 - lookup_width_q);
             lookup_addr_r  = input_code_r - cx_dc_min_code_q[lookup_width_q] + {6'b0, cx_dc_ptr_q[lookup_width_q]};
         end
         default:
         begin
-            input_code_r   = lookup_input_i >> (15 - lookup_width_q);
+            input_code_r   = lookup_input_d >> (15 - lookup_width_q);
             lookup_addr_r  = input_code_r - cx_ac_min_code_q[lookup_width_q] + {6'b0, cx_ac_ptr_q[lookup_width_q]};
         end
         endcase
@@ -699,7 +715,7 @@ begin
     if (rst_i)
         lookup_valid_q <= 1'b0;
     else
-        lookup_valid_q <= lookup_req_i;
+        lookup_valid_q <= lookup_req_d;
 
     reg lookup_valid2_q;
     always @ (posedge clk_i )

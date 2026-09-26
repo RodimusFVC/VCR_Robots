@@ -315,13 +315,17 @@ pause #(8,8,8,CORE_CLK_HZ/1000000) pause  // CLKSPD in MHz; was hardcoded 10 whi
 wire        rr_ce_pix, rr_hs, rr_vs, rr_hblank, rr_vblank;
 wire [15:0] rr_hpos, rr_vpos;
 wire  [7:0] rr_r, rr_g, rr_b;
-wire  [7:0] comp_r = rr_r;
-wire  [7:0] comp_g = rr_g;
-wire  [7:0] comp_b = rr_b;
-wire [26:0] rr_rdaddr2;
-wire [15:0] rr_dout2;
-wire [63:0] rr_dout2_64;    // READ-COALESCE-2026-07-20: whole cached word from ddram read port 2
-wire        rr_rd_req2, rr_rd_ack2;
+wire  [7:0] comp_r, comp_g, comp_b;   // video + menu selection border (assigned after the panel renderer)
+// DIAG: 16-bit status readout in the panel. Two rows of 8 stripes, white = 1, grey = 0, read left->right.
+//   top row    0 fb_ddr waiting on a read burst   1 reader waiting (lr_req!=lr_ack)
+//              2 writer waiting (we_req!=we_ack)  3 fill_idle
+//              4 EVER got read data               5 EVER completed a line burst
+//              6 EVER got a write ack             7 DDRAM_BUSY right now
+//   bottom row fb_ddr beats_left[7:0], MSB first
+wire [24:0] rr_lr_addr;     // fb_raster_reader -> fb_ddr line-burst port
+wire  [7:0] rr_lr_len;
+wire        rr_lr_req, rr_lr_ack, rr_lr_valid;
+wire [63:0] rr_lr_data;
 // WRITE-GATE-2026-07-16 (new wire, delete on revert): fb_raster_reader tells fb_writer when its
 // line fetch has landed, so the writer never contends with an in-flight read2.  Declared here
 // because fb_writer is instantiated ABOVE fb_raster_reader.
@@ -418,6 +422,18 @@ wire  [5:0] cards_revealed_w;    // sticky reveal mask for the thumbnail strip
 // assumed: Start is joystick_0[9] -> m_start1 -> cab[0], which does NOT collide with the
 // MiSTer system pause on joystick_0[11] (m_pause -> pause_cpu). Those are two different
 // pauses and both are wired: Start holds the TAPE, the OSD/P pause freezes the whole core.
+wire  [1:0] g_phase_w, g_packet_w;   // game state -> panel renderer
+wire        g_pick_w;
+wire  [5:0] g_seed_w;
+wire  [1:0] g_cm_w;                  // card moment: 0 none, 1 choose face, 2 zoomed
+wire  [2:0] g_cm_card_w;
+wire        g_cm_sel_w;
+wire  [4:0] g_focus_w;      // cursor: 0 video, 1 Map, 2 Suspects, 3..8 card A..F, 9..19 suspects, 20..23 endgame buttons
+wire  [2:0] g_view_w;       // view: 0 none, 1 map, 2 leaflet, 3 answer, 4 notebook, 5 game assets, 6 clue zoom
+wire  [3:0] g_gal_w;        // game assets item
+wire  [1:0] g_eg_w;         // endgame: 0 play, 1 accusation, 2 verdict (credits), 3 end
+wire        g_armed_w, g_win_w;
+wire  [4:0] g_page_w;       // answer / notebook page
 Robots #(.CLK_HZ(CORE_CLK_HZ)) robots_inst
 (
 	.reset(~reset),       // MiSTer reset is active-high; invert for active-low game modules
@@ -451,7 +467,11 @@ Robots #(.CLK_HZ(CORE_CLK_HZ)) robots_inst
 	// card_show_w is high across the whole Clue Card segment while the tape keeps
 	// rolling, so the renderer paints the card over the video window and the
 	// on-tape audio sting plays underneath.
-	.card_show_o(card_show_w), .card_id_o(card_id_w), .cards_revealed_o(cards_revealed_w)
+	.card_show_o(card_show_w), .card_id_o(card_id_w), .cards_revealed_o(cards_revealed_w),
+	.phase_o(g_phase_w), .packet_o(g_packet_w), .pick_mode_o(g_pick_w), .seed_o(g_seed_w),
+	.cm_o(g_cm_w), .cm_card_o(g_cm_card_w), .cm_sel_o(g_cm_sel_w),
+	.focus_o(g_focus_w), .view_o(g_view_w), .gal_o(g_gal_w),
+	.eg_o(g_eg_w), .armed_o(g_armed_w), .win_o(g_win_w), .page_o(g_page_w)
 );
 
 // HISCORE REMOVED 2026-07-04 — Dragon's Lair / Space Ace / Thayer's Quest do not
@@ -481,7 +501,7 @@ assign FB_EN     = 1'b0;
 assign FB_FORMAT = 5'b00100;      // (ignored while FB_EN=0) [2:0]=100 16bpp, [3]=0 565, [4]=0 RGB
 assign FB_WIDTH  = 12'd320;
 assign FB_HEIGHT = 12'd240;
-assign FB_BASE   = 32'h30000000;  // must match ddram.sv region base
+assign FB_BASE   = 32'h30000000;  // must match fb_ddr.sv region base
 assign FB_STRIDE = 14'd640;       // 320 px * 2 B (tight 16bpp)
 
 assign DDRAM_CLK = CLK_40M;
@@ -509,6 +529,13 @@ wire  [7:0] strm_byte;
 wire        strm_valid, strm_ready, strm_last;
 wire        dec_reset_w;                // STREAMING-2026-07-04: per-frame decoder reset (decoder only)
 wire signed [15:0] pcm_l, pcm_r;        // STREAMING-2026-07-04: .dlv PCM -> audio mux (see AUDIO_L/R above)
+wire        dec_frame_done, dec_idle;   // declared here: the streamer's blit interlock reads dec_idle
+// Asset blit (streamer fetches a .dlv asset frame; decoder + fb_writer draw it into the panel)
+reg         blit_req_r = 1'b0;
+reg  [16:0] blit_frame_r = 17'd0;
+reg         blit_busy = 1'b0;           // a blit is decoding: hold off video fetches
+wire        blit_ack_w, fetch_blit_w, blit_start_w, blit_fail_w;
+wire [16:0] tape_frames_w;
 
 // STREAMING-2026-07-04: continuous video+audio streamer.  Free-runs film frames from START_FRAME
 // (paced ~30 fps), and keeps a 44.1 kHz PCM ring topped up (audio has SD priority).  The one-shot
@@ -526,7 +553,10 @@ dlv_streamer #(.CLK_HZ(CORE_CLK_HZ), .START_FRAME(17'd0)) dlv_strm (
     .pcm_l(pcm_l), .pcm_r(pcm_r),
     .ld_curr_frame(ld_curr_frame_top), .pause(pause_cpu),   // HLE-DRIVE-2026-07-04
     .aud_primed(fb_aud_primed), .hold_play(fb_seek_hold), .seek_flush(fb_seek_pulse),   // SEEK-HOLD/FLUSH-2026-07-20
-    .ld_playing(ld_playing_top)                             // AUDIO-GATE-2026-07-05
+    .ld_playing(ld_playing_top),                            // AUDIO-GATE-2026-07-05
+    .blit_req(blit_req_r), .blit_frame(blit_frame_r), .blit_ack(blit_ack_w),
+    .dec_idle(dec_idle), .blit_hold(blit_busy),
+    .fetch_blit(fetch_blit_w), .blit_start(blit_start_w), .blit_fail(blit_fail_w), .tape_frames(tape_frames_w)
 );
 
 
@@ -534,7 +564,6 @@ dlv_streamer #(.CLK_HZ(CORE_CLK_HZ), .START_FRAME(17'd0)) dlv_strm (
 wire        dec_px_we, dec_px_ready;
 wire [15:0] dec_px_x, dec_px_y, dec_w, dec_h;
 wire  [7:0] dec_px_r, dec_px_g, dec_px_b;
-wire        dec_frame_done, dec_idle;
 
 jpeg_frame_decoder dec (
     .clk(CLK_40M), .rst(dec_reset_w),   // STREAMING-2026-07-04: per-frame reset (NOT global); fb_writer stays on global reset
@@ -543,6 +572,7 @@ jpeg_frame_decoder dec (
     .px_x(dec_px_x), .px_y(dec_px_y), .px_r(dec_px_r), .px_g(dec_px_g), .px_b(dec_px_b),
     .frame_width(dec_w), .frame_height(dec_h), .frame_done(dec_frame_done), .idle(dec_idle)
 );
+
 
 // FB-DOUBLEBUF-2026-07-15: two-frame ping-pong so the decoder never writes into the same buffer
 // the raster reader is scanning out of. Root cause of the black-line-comb/streak bug (latest17):
@@ -606,6 +636,24 @@ localparam [15:0] CANVAS_BG    = 16'h10A3;    // RGB565 near-black blue, matches
 localparam [26:0] FB_BUF0_HW   = 27'd0;
 localparam [26:0] FB_BUF1_HW   = FB_BUF_HW;
 localparam [26:0] FB_BUF2_HW   = FB_BUF_HW * 2;
+localparam [26:0] PANEL_BASE_HW = FB_BUF_HW * 3;   // single 960x540 panel buffer (stride CANVAS_W) after the 3 video buffers
+// Card thumbnail slots (canvas pixels): 279x321 -> 140x161, a 3x2 grid on the right: A B C / D E F.
+localparam [15:0] SLOT_X0 = 16'd519, SLOT_X1 = 16'd666, SLOT_X2 = 16'd813;
+localparam [15:0] SLOT_Y0 = 16'd200, SLOT_Y1 = 16'd370;
+reg  [26:0] blit_base_r = 27'd0;
+reg         blit_half_r = 1'b0;
+reg  [15:0] blit_dx_r = 16'd0, blit_dy_r = 16'd0;
+// Destination of the blit being decoded, latched when its fetch starts: a later request must not redirect it.
+reg  [26:0] blit_base_a = 27'd0;
+reg         blit_half_a = 1'b0;
+reg  [15:0] blit_dx_a = 16'd0, blit_dy_a = 16'd0;
+// never past the panel edge (clip is in source pixels; a half-size blit covers twice its room)
+wire [15:0] blit_room_w = CANVAS_W - blit_dx_a;
+wire [15:0] blit_room_h = CANVAS_H - blit_dy_a;
+wire [15:0] blit_lim_w  = blit_half_a ? {blit_room_w[14:0], 1'b0} : blit_room_w;
+wire [15:0] blit_lim_h  = blit_half_a ? {blit_room_h[14:0], 1'b0} : blit_room_h;
+wire [15:0] blit_clip_w = (dec_w > blit_lim_w) ? blit_lim_w : dec_w;
+wire [15:0] blit_clip_h = (dec_h > blit_lim_h) ? blit_lim_h : dec_h;
 
 reg  [1:0] fb_wr_idx;      // buffer the decoder is writing
 reg  [1:0] fb_disp_idx;    // buffer the raster reader is displaying
@@ -616,6 +664,603 @@ reg        fb_have_new;    // a completed frame is waiting for the next vblank
 localparam [2:0]  SEEK_PRIME = 3'd3;          // post-seek frames to bank before resuming
 localparam [31:0] CORE_CLK_HZ = 32'd100_000_000;   // CLK-PARAM-2026-08-15: single source
 localparam [27:0] SEEK_TMO   = CORE_CLK_HZ[27:0];  // ~1 s at any clock  // ~1 s @40 MHz -- SAFETY, see below
+
+// Blit bookkeeping: busy from the blit fetch until its decode completes (or 100 ms, so a bad
+// asset can never stall video).
+localparam [26:0] BLIT_TMO = CORE_CLK_HZ[26:0];   // 1 s: a full-size card over real SD can exceed 100 ms
+reg [26:0] blit_tmr = 27'd0;
+reg        blit_ok = 1'b0;             // BLIT-RETRY-2026-09-25: this blit's decode reached its last pixel
+always @(posedge CLK_40M) begin
+    if (reset || blit_start_w) blit_ok <= 1'b0;
+    else if (blit_busy && dec_frame_done) blit_ok <= 1'b1;
+end
+always @(posedge CLK_40M) begin
+    if (reset) begin
+        blit_busy <= 1'b0; blit_tmr <= 27'd0;
+    end else if (blit_start_w) begin
+        blit_busy <= 1'b1; blit_tmr <= 27'd0;
+        blit_base_a <= blit_base_r; blit_half_a <= blit_half_r; blit_dx_a <= blit_dx_r; blit_dy_a <= blit_dy_r;
+    end else if (blit_busy) begin
+        // BLIT-RETRY-2026-09-25 original: if (dec_frame_done || blit_tmr == BLIT_TMO) blit_busy <= 1'b0;
+        if (dec_frame_done || blit_fail_w || blit_tmr == BLIT_TMO) blit_busy <= 1'b0;
+        else blit_tmr <= blit_tmr + 27'd1;
+    end
+end
+
+// Panel renderer: every piece of panel art is an asset blit, requested on game events.
+//   menus      : entering a menu repaints the panel, then draws ALL of that menu's choices as
+//                half-size plates in a column in the video window (video is off in the menus);
+//                the selection is a border drawn at scanout, so moving it redraws nothing
+//   thumbnails : one per newly revealed card, into its slot
+//   restart    : back to the skill menu = repaint (thumbnails gone) + skill plates
+// Asset k is .dlv frame tape_frames + k (layout: _VCR/assets/manifest.json).
+localparam [16:0] A_DIFFICULTY = 17'd311;   // difficulty_0_beginner .. difficulty_3_expert (420x200)
+localparam [16:0] A_MODE       = 17'd315;   // mode_0_random, mode_1_choose
+localparam [15:0] PLATE_X = 16'd151;        // 210x100 half-size plates, centred in the 512x480 window
+localparam [15:0] PLATE_W = 16'd210, PLATE_H = 16'd100, PLATE_PITCH = 16'd116, PLATE_Y0 = 16'd46;
+localparam [16:0] A_BTN_MAP    = 17'd305;   // btn_0_show_map, btn_1_suspects (426x140), half-size along the panel top
+localparam [15:0] MAP_X = 16'd520, MAP_Y = 16'd8, BTN_PITCH = 16'd219;
+reg  [1:0] ph_q = 2'd3;
+reg  [5:0] cards_q = 6'd0;
+reg  [3:0] plate_need = 4'd0;                // plate rows still to draw on the current menu screen
+reg  [5:0] card_need = 6'd0;
+reg  [1:0] cm_q = 2'd0;
+reg  [1:0] face_need = 2'd0;                // card moment, choose: both faces still to draw
+reg        zoom_need = 1'b0;                // card moment: the zoomed card still to draw
+reg  [1:0] map_need = 2'd0;                 // Show Map / Suspects buttons still to draw (first card moment of a game)
+reg        map_drawn = 1'b0;
+reg        blit_cm_q = 1'b0;                // the blit in flight is modal art (card moment or study view)
+// Study views, half-size tiles from the .dlv: map = leaflet_map (2 tiles, 586x540);
+// leaflet = Important Data | Cast | Cast, pages side by side (5 tiles, 837x540).
+localparam [16:0] A_LEAFLET = 17'd271;       // map t0,t1 = 271,272; page1 273,274; page2 275,276; page3 277
+// Views 3-6 and the endgame panel (2026-09-25): answer page (2 tiles, 285x540 over the video column),
+// notebook (3 tiles, full width, centred), game assets (2-6 tiles, full canvas), clue zoom (the full card).
+localparam [16:0] A_SUSPECT = 17'd317;       // suspect_00..10 (760x88) -> 380x44 plates over the frozen video
+localparam [15:0] SUS_X = 16'd66, SUS_Y0 = 16'd17, SUS_PITCH = 16'd46, SUS_W = 16'd380, SUS_H = 16'd44;
+localparam [15:0] EGB_X0 = 16'd520, EGB_X1 = 16'd739, EGB_Y0 = 16'd85, EGB_Y1 = 16'd163;   // endgame buttons
+reg  [5:0] view_need = 6'd0;
+reg  [2:0] view_q = 3'd0;
+reg  [3:0] gal_q = 4'd0;
+reg  [1:0] eg_q = 2'd0;
+reg  [4:0] eg_need = 5'd0;                   // banner, Full Answer, Baley's Notes, Play Again, Game Assets
+reg [10:0] sus_need = 11'd0;                 // suspect plates still to draw
+reg  [2:0] closed_v = 3'd0;                  // the view that just closed
+// BLIT-RETRY-2026-09-25: a blit that ends without a completed decode (watchdog abort or timeout) is
+// re-issued unchanged -- the blit_*_r registers still hold it -- up to 3 times, before anything else.
+reg        retry_pend = 1'b0;
+reg  [1:0] retry_cnt = 2'd0;
+reg        verdict_pend = 1'b0;              // verdict: clear the panel once nothing is in flight
+reg        view_close = 1'b0;                // a view just closed: repaint the panel once nothing is in flight
+reg        cm_post = 1'b0;                  // after B: keep the zoomed card up until the tape's jump has settled
+reg        cm_post_hold = 1'b0;             // the seek hold for that jump has started
+reg [27:0] cm_post_tmr = 28'd0;
+wire [1:0] disp_cm = (g_cm_w != 2'd0) ? g_cm_w : (cm_post ? 2'd2 : 2'd0);   // what the video column shows
+reg        pf_refill = 1'b0;
+reg        pf_wait = 1'b0;                  // refill requested, filler not yet restarted
+reg        blit_inflight = 1'b0;            // issued and not yet decoded: its destination must not change
+reg        blit_busy_q = 1'b0;
+// Original: reg [24:0] blit_wait_tmr (dropped after ~0.3 s -- shorter than a post-seek audio refill on real SD)
+reg [27:0] blit_wait_tmr = 28'd0;           // safety: a request never picked up is dropped after ~2.7 s
+wire       pf_done;
+wire       in_menu   = (g_phase_w != 2'd2);
+wire [5:0] need_now  = card_need | (cards_revealed_w & ~cards_q);
+wire [2:0] need_k    = need_now[0] ? 3'd0 : need_now[1] ? 3'd1 : need_now[2] ? 3'd2 :
+                       need_now[3] ? 3'd3 : need_now[4] ? 3'd4 : 3'd5;
+wire [15:0] slot_x   = (need_k == 3'd0 || need_k == 3'd3) ? SLOT_X0 :
+                       (need_k == 3'd1 || need_k == 3'd4) ? SLOT_X1 : SLOT_X2;
+wire [15:0] slot_y   = (need_k < 3'd3) ? SLOT_Y0 : SLOT_Y1;
+wire [26:0] slot_base = PANEL_BASE_HW + slot_y * CANVAS_W + {11'd0, slot_x};
+wire [16:0] thumb_asset = {12'd0, g_packet_w, 3'b000} * 17'd3 + {12'd0, need_k, 2'b00} + {15'd0, g_seed_w[need_k], 1'b0} + 17'd1;   // p*24 + k*4 + side*2 + 1
+// Card moment art in the 512-wide video column: faces 225x259 side by side, zoomed card 449x517.
+localparam [15:0] FACE_X0 = 16'd21, FACE_X1 = 16'd266, FACE_Y = 16'd140, FACE_W = 16'd225, FACE_H = 16'd259;
+localparam [15:0] ZOOM_X  = 16'd31, ZOOM_Y  = 16'd11,  ZOOM_W = 16'd449, ZOOM_H = 16'd517;
+wire        face_j    = face_need[0] ? 1'b0 : 1'b1;
+wire [16:0] card_asset_base = {12'd0, g_packet_w, 3'b000} * 17'd3 + {12'd0, g_cm_card_w, 2'b00};   // p*24 + k*4
+wire [16:0] face_asset = card_asset_base + {15'd0, face_j, 1'b0};                 // full card, face j
+wire [16:0] zoom_asset = card_asset_base + {15'd0, g_seed_w[g_cm_card_w], 1'b0};  // full card, chosen face
+wire [15:0] face_x    = face_j ? FACE_X1 : FACE_X0;
+// GENERATED from _VCR/assets/manifest.json (2026-09-25): half-size tile placement, {valid, asset[8:0], x[9:0], y[9:0]}.
+function [29:0] notes_tile(input [4:0] pg, input [2:0] j);
+    case ({pg, j})
+        8'd0: notes_tile = {1'b1, 9'd160, 10'd0, 10'd49};   // notes_A t0
+        8'd1: notes_tile = {1'b1, 9'd161, 10'd0, 10'd195};   // notes_A t1
+        8'd2: notes_tile = {1'b1, 9'd162, 10'd0, 10'd342};   // notes_A t2
+        8'd8: notes_tile = {1'b1, 9'd163, 10'd0, 10'd77};   // notes_B t0
+        8'd9: notes_tile = {1'b1, 9'd164, 10'd0, 10'd205};   // notes_B t1
+        8'd10: notes_tile = {1'b1, 9'd165, 10'd0, 10'd334};   // notes_B t2
+        8'd16: notes_tile = {1'b1, 9'd166, 10'd0, 10'd51};   // notes_C t0
+        8'd17: notes_tile = {1'b1, 9'd167, 10'd0, 10'd196};   // notes_C t1
+        8'd18: notes_tile = {1'b1, 9'd168, 10'd0, 10'd342};   // notes_C t2
+        8'd24: notes_tile = {1'b1, 9'd169, 10'd0, 10'd41};   // notes_D t0
+        8'd25: notes_tile = {1'b1, 9'd170, 10'd0, 10'd155};   // notes_D t1
+        8'd26: notes_tile = {1'b1, 9'd171, 10'd0, 10'd270};   // notes_D t2
+        8'd27: notes_tile = {1'b1, 9'd172, 10'd0, 10'd384};   // notes_D t3
+        8'd32: notes_tile = {1'b1, 9'd173, 10'd0, 10'd47};   // notes_E t0
+        8'd33: notes_tile = {1'b1, 9'd174, 10'd0, 10'd158};   // notes_E t1
+        8'd34: notes_tile = {1'b1, 9'd175, 10'd0, 10'd269};   // notes_E t2
+        8'd35: notes_tile = {1'b1, 9'd176, 10'd0, 10'd380};   // notes_E t3
+        8'd40: notes_tile = {1'b1, 9'd177, 10'd0, 10'd67};   // notes_F t0
+        8'd41: notes_tile = {1'b1, 9'd178, 10'd0, 10'd202};   // notes_F t1
+        8'd42: notes_tile = {1'b1, 9'd179, 10'd0, 10'd337};   // notes_F t2
+        8'd48: notes_tile = {1'b1, 9'd180, 10'd0, 10'd70};   // notes_G t0
+        8'd49: notes_tile = {1'b1, 9'd181, 10'd0, 10'd203};   // notes_G t1
+        8'd50: notes_tile = {1'b1, 9'd182, 10'd0, 10'd336};   // notes_G t2
+        8'd56: notes_tile = {1'b1, 9'd183, 10'd0, 10'd26};   // notes_H t0
+        8'd57: notes_tile = {1'b1, 9'd184, 10'd0, 10'd148};   // notes_H t1
+        8'd58: notes_tile = {1'b1, 9'd185, 10'd0, 10'd270};   // notes_H t2
+        8'd59: notes_tile = {1'b1, 9'd186, 10'd0, 10'd392};   // notes_H t3
+        8'd64: notes_tile = {1'b1, 9'd187, 10'd0, 10'd41};   // notes_I t0
+        8'd65: notes_tile = {1'b1, 9'd188, 10'd0, 10'd155};   // notes_I t1
+        8'd66: notes_tile = {1'b1, 9'd189, 10'd0, 10'd269};   // notes_I t2
+        8'd67: notes_tile = {1'b1, 9'd190, 10'd0, 10'd383};   // notes_I t3
+        8'd72: notes_tile = {1'b1, 9'd191, 10'd0, 10'd73};   // notes_J t0
+        8'd73: notes_tile = {1'b1, 9'd192, 10'd0, 10'd204};   // notes_J t1
+        8'd74: notes_tile = {1'b1, 9'd193, 10'd0, 10'd335};   // notes_J t2
+        8'd80: notes_tile = {1'b1, 9'd194, 10'd0, 10'd99};   // notes_K t0
+        8'd81: notes_tile = {1'b1, 9'd195, 10'd0, 10'd213};   // notes_K t1
+        8'd82: notes_tile = {1'b1, 9'd196, 10'd0, 10'd327};   // notes_K t2
+        8'd88: notes_tile = {1'b1, 9'd197, 10'd0, 10'd71};   // notes_L t0
+        8'd89: notes_tile = {1'b1, 9'd198, 10'd0, 10'd203};   // notes_L t1
+        8'd90: notes_tile = {1'b1, 9'd199, 10'd0, 10'd336};   // notes_L t2
+        8'd96: notes_tile = {1'b1, 9'd200, 10'd0, 10'd98};   // notes_M t0
+        8'd97: notes_tile = {1'b1, 9'd201, 10'd0, 10'd212};   // notes_M t1
+        8'd98: notes_tile = {1'b1, 9'd202, 10'd0, 10'd327};   // notes_M t2
+        8'd104: notes_tile = {1'b1, 9'd203, 10'd0, 10'd20};   // notes_N t0
+        8'd105: notes_tile = {1'b1, 9'd204, 10'd0, 10'd144};   // notes_N t1
+        8'd106: notes_tile = {1'b1, 9'd205, 10'd0, 10'd269};   // notes_N t2
+        8'd107: notes_tile = {1'b1, 9'd206, 10'd0, 10'd393};   // notes_N t3
+        8'd112: notes_tile = {1'b1, 9'd207, 10'd0, 10'd70};   // notes_O t0
+        8'd113: notes_tile = {1'b1, 9'd208, 10'd0, 10'd203};   // notes_O t1
+        8'd114: notes_tile = {1'b1, 9'd209, 10'd0, 10'd336};   // notes_O t2
+        8'd120: notes_tile = {1'b1, 9'd210, 10'd0, 10'd71};   // notes_P t0
+        8'd121: notes_tile = {1'b1, 9'd211, 10'd0, 10'd203};   // notes_P t1
+        8'd122: notes_tile = {1'b1, 9'd212, 10'd0, 10'd335};   // notes_P t2
+        8'd128: notes_tile = {1'b1, 9'd213, 10'd0, 10'd72};   // notes_Q t0
+        8'd129: notes_tile = {1'b1, 9'd214, 10'd0, 10'd203};   // notes_Q t1
+        8'd130: notes_tile = {1'b1, 9'd215, 10'd0, 10'd335};   // notes_Q t2
+        8'd136: notes_tile = {1'b1, 9'd216, 10'd0, 10'd39};   // notes_R t0
+        8'd137: notes_tile = {1'b1, 9'd217, 10'd0, 10'd192};   // notes_R t1
+        8'd138: notes_tile = {1'b1, 9'd218, 10'd0, 10'd346};   // notes_R t2
+        8'd144: notes_tile = {1'b1, 9'd219, 10'd0, 10'd68};   // notes_S t0
+        8'd145: notes_tile = {1'b1, 9'd220, 10'd0, 10'd168};   // notes_S t1
+        8'd146: notes_tile = {1'b1, 9'd221, 10'd0, 10'd269};   // notes_S t2
+        8'd147: notes_tile = {1'b1, 9'd222, 10'd0, 10'd369};   // notes_S t3
+        8'd152: notes_tile = {1'b1, 9'd223, 10'd0, 10'd74};   // notes_T t0
+        8'd153: notes_tile = {1'b1, 9'd224, 10'd0, 10'd204};   // notes_T t1
+        8'd154: notes_tile = {1'b1, 9'd225, 10'd0, 10'd335};   // notes_T t2
+        8'd160: notes_tile = {1'b1, 9'd226, 10'd0, 10'd48};   // notes_U t0
+        8'd161: notes_tile = {1'b1, 9'd227, 10'd0, 10'd159};   // notes_U t1
+        8'd162: notes_tile = {1'b1, 9'd228, 10'd0, 10'd270};   // notes_U t2
+        8'd163: notes_tile = {1'b1, 9'd229, 10'd0, 10'd381};   // notes_U t3
+        8'd168: notes_tile = {1'b1, 9'd230, 10'd0, 10'd48};   // notes_V t0
+        8'd169: notes_tile = {1'b1, 9'd231, 10'd0, 10'd158};   // notes_V t1
+        8'd170: notes_tile = {1'b1, 9'd232, 10'd0, 10'd269};   // notes_V t2
+        8'd171: notes_tile = {1'b1, 9'd233, 10'd0, 10'd379};   // notes_V t3
+        8'd176: notes_tile = {1'b1, 9'd234, 10'd0, 10'd0};   // notes_W t0
+        8'd177: notes_tile = {1'b1, 9'd235, 10'd0, 10'd135};   // notes_W t1
+        8'd178: notes_tile = {1'b1, 9'd236, 10'd0, 10'd270};   // notes_W t2
+        8'd179: notes_tile = {1'b1, 9'd237, 10'd0, 10'd405};   // notes_W t3
+        8'd184: notes_tile = {1'b1, 9'd238, 10'd0, 10'd50};   // notes_X t0
+        8'd185: notes_tile = {1'b1, 9'd239, 10'd0, 10'd160};   // notes_X t1
+        8'd186: notes_tile = {1'b1, 9'd240, 10'd0, 10'd270};   // notes_X t2
+        8'd187: notes_tile = {1'b1, 9'd241, 10'd0, 10'd380};   // notes_X t3
+        8'd192: notes_tile = {1'b1, 9'd242, 10'd0, 10'd51};   // notes_Y t0
+        8'd193: notes_tile = {1'b1, 9'd243, 10'd0, 10'd160};   // notes_Y t1
+        8'd194: notes_tile = {1'b1, 9'd244, 10'd0, 10'd269};   // notes_Y t2
+        8'd195: notes_tile = {1'b1, 9'd245, 10'd0, 10'd378};   // notes_Y t3
+        8'd200: notes_tile = {1'b1, 9'd246, 10'd0, 10'd76};   // notes_Z t0
+        8'd201: notes_tile = {1'b1, 9'd247, 10'd0, 10'd205};   // notes_Z t1
+        8'd202: notes_tile = {1'b1, 9'd248, 10'd0, 10'd334};   // notes_Z t2
+        8'd208: notes_tile = {1'b1, 9'd249, 10'd0, 10'd47};   // notes_AA t0
+        8'd209: notes_tile = {1'b1, 9'd250, 10'd0, 10'd158};   // notes_AA t1
+        8'd210: notes_tile = {1'b1, 9'd251, 10'd0, 10'd269};   // notes_AA t2
+        8'd211: notes_tile = {1'b1, 9'd252, 10'd0, 10'd380};   // notes_AA t3
+        8'd216: notes_tile = {1'b1, 9'd253, 10'd0, 10'd48};   // notes_BB t0
+        8'd217: notes_tile = {1'b1, 9'd254, 10'd0, 10'd159};   // notes_BB t1
+        8'd218: notes_tile = {1'b1, 9'd255, 10'd0, 10'd270};   // notes_BB t2
+        8'd219: notes_tile = {1'b1, 9'd256, 10'd0, 10'd381};   // notes_BB t3
+        8'd224: notes_tile = {1'b1, 9'd257, 10'd0, 10'd92};   // notes_CC t0
+        8'd225: notes_tile = {1'b1, 9'd258, 10'd0, 10'd210};   // notes_CC t1
+        8'd226: notes_tile = {1'b1, 9'd259, 10'd0, 10'd329};   // notes_CC t2
+        8'd232: notes_tile = {1'b1, 9'd260, 10'd0, 10'd21};   // notes_DD t0
+        8'd233: notes_tile = {1'b1, 9'd261, 10'd0, 10'd145};   // notes_DD t1
+        8'd234: notes_tile = {1'b1, 9'd262, 10'd0, 10'd269};   // notes_DD t2
+        8'd235: notes_tile = {1'b1, 9'd263, 10'd0, 10'd393};   // notes_DD t3
+        8'd240: notes_tile = {1'b1, 9'd264, 10'd0, 10'd20};   // notes_EE t0
+        8'd241: notes_tile = {1'b1, 9'd265, 10'd0, 10'd145};   // notes_EE t1
+        8'd242: notes_tile = {1'b1, 9'd266, 10'd0, 10'd270};   // notes_EE t2
+        8'd243: notes_tile = {1'b1, 9'd267, 10'd0, 10'd395};   // notes_EE t3
+        8'd248: notes_tile = {1'b1, 9'd268, 10'd0, 10'd76};   // notes_FF t0
+        8'd249: notes_tile = {1'b1, 9'd269, 10'd0, 10'd205};   // notes_FF t1
+        8'd250: notes_tile = {1'b1, 9'd270, 10'd0, 10'd334};   // notes_FF t2
+        default: notes_tile = 30'd0;
+    endcase
+endfunction
+function [19:0] notes_geo(input [4:0] pg);   // {y0, height} of the half-size page, centred vertically
+    case (pg)
+        5'd0: notes_geo = {10'd49, 10'd441};
+        5'd1: notes_geo = {10'd77, 10'd386};
+        5'd2: notes_geo = {10'd51, 10'd438};
+        5'd3: notes_geo = {10'd41, 10'd458};
+        5'd4: notes_geo = {10'd47, 10'd445};
+        5'd5: notes_geo = {10'd67, 10'd405};
+        5'd6: notes_geo = {10'd70, 10'd399};
+        5'd7: notes_geo = {10'd26, 10'd488};
+        5'd8: notes_geo = {10'd41, 10'd457};
+        5'd9: notes_geo = {10'd73, 10'd393};
+        5'd10: notes_geo = {10'd99, 10'd342};
+        5'd11: notes_geo = {10'd71, 10'd398};
+        5'd12: notes_geo = {10'd98, 10'd344};
+        5'd13: notes_geo = {10'd20, 10'd499};
+        5'd14: notes_geo = {10'd70, 10'd400};
+        5'd15: notes_geo = {10'd71, 10'd397};
+        5'd16: notes_geo = {10'd72, 10'd395};
+        5'd17: notes_geo = {10'd39, 10'd461};
+        5'd18: notes_geo = {10'd68, 10'd403};
+        5'd19: notes_geo = {10'd74, 10'd392};
+        5'd20: notes_geo = {10'd48, 10'd444};
+        5'd21: notes_geo = {10'd48, 10'd444};
+        5'd22: notes_geo = {10'd0, 10'd540};
+        5'd23: notes_geo = {10'd50, 10'd440};
+        5'd24: notes_geo = {10'd51, 10'd438};
+        5'd25: notes_geo = {10'd76, 10'd388};
+        5'd26: notes_geo = {10'd47, 10'd446};
+        5'd27: notes_geo = {10'd48, 10'd444};
+        5'd28: notes_geo = {10'd92, 10'd356};
+        5'd29: notes_geo = {10'd21, 10'd498};
+        5'd30: notes_geo = {10'd20, 10'd500};
+        5'd31: notes_geo = {10'd76, 10'd388};
+        default: notes_geo = {10'd50, 10'd440};
+    endcase
+endfunction
+function [29:0] gal_tile(input [3:0] g, input [2:0] j);   // game assets: box, box_flap, tape, answer_covers, notes_covers, 4 sleeves
+    case ({g, j})
+        7'd0: gal_tile = {1'b1, 9'd278, 10'd0, 10'd0};   // box t0
+        7'd1: gal_tile = {1'b1, 9'd279, 10'd0, 10'd135};   // box t1
+        7'd2: gal_tile = {1'b1, 9'd280, 10'd0, 10'd270};   // box t2
+        7'd3: gal_tile = {1'b1, 9'd281, 10'd0, 10'd405};   // box t3
+        7'd8: gal_tile = {1'b1, 9'd282, 10'd0, 10'd0};   // box_flap t0
+        7'd9: gal_tile = {1'b1, 9'd283, 10'd0, 10'd270};   // box_flap t1
+        7'd16: gal_tile = {1'b1, 9'd284, 10'd0, 10'd0};   // tape t0
+        7'd17: gal_tile = {1'b1, 9'd285, 10'd0, 10'd90};   // tape t1
+        7'd18: gal_tile = {1'b1, 9'd286, 10'd0, 10'd180};   // tape t2
+        7'd19: gal_tile = {1'b1, 9'd287, 10'd0, 10'd270};   // tape t3
+        7'd20: gal_tile = {1'b1, 9'd288, 10'd0, 10'd360};   // tape t4
+        7'd21: gal_tile = {1'b1, 9'd289, 10'd0, 10'd450};   // tape t5
+        7'd24: gal_tile = {1'b1, 9'd290, 10'd0, 10'd0};   // answer_covers t0
+        7'd25: gal_tile = {1'b1, 9'd291, 10'd0, 10'd180};   // answer_covers t1
+        7'd26: gal_tile = {1'b1, 9'd292, 10'd0, 10'd360};   // answer_covers t2
+        7'd32: gal_tile = {1'b1, 9'd293, 10'd0, 10'd0};   // notes_covers t0
+        7'd33: gal_tile = {1'b1, 9'd294, 10'd0, 10'd270};   // notes_covers t1
+        7'd40: gal_tile = {1'b1, 9'd295, 10'd0, 10'd0};   // sleeve_beg t0
+        7'd41: gal_tile = {1'b1, 9'd296, 10'd0, 10'd270};   // sleeve_beg t1
+        7'd48: gal_tile = {1'b1, 9'd297, 10'd0, 10'd0};   // sleeve_int t0
+        7'd49: gal_tile = {1'b1, 9'd298, 10'd0, 10'd270};   // sleeve_int t1
+        7'd56: gal_tile = {1'b1, 9'd299, 10'd0, 10'd0};   // sleeve_adv t0
+        7'd57: gal_tile = {1'b1, 9'd300, 10'd0, 10'd270};   // sleeve_adv t1
+        7'd64: gal_tile = {1'b1, 9'd301, 10'd0, 10'd0};   // sleeve_exp t0
+        7'd65: gal_tile = {1'b1, 9'd302, 10'd0, 10'd270};   // sleeve_exp t1
+        default: gal_tile = 30'd0;
+    endcase
+endfunction
+wire [2:0] view_j    = view_need[0] ? 3'd0 : view_need[1] ? 3'd1 : view_need[2] ? 3'd2 :
+                       view_need[3] ? 3'd3 : view_need[4] ? 3'd4 : 3'd5;
+wire [4:0]  zk5       = g_focus_w - 5'd3;                                  // clue zoom: card under the cursor
+wire [2:0]  zk        = zk5[2:0];
+wire [16:0] zcard     = {12'd0, g_packet_w, 3'b000} * 17'd3 + {12'd0, zk, 2'b00} + {15'd0, g_seed_w[zk], 1'b0};
+wire [29:0] map_t     = (view_j == 3'd0) ? {1'b1, 9'd271, 10'd0, 10'd0} : (view_j == 3'd1) ? {1'b1, 9'd272, 10'd0, 10'd270} : 30'd0;
+wire [29:0] leaf_t    = (view_j == 3'd0) ? {1'b1, 9'd273, 10'd0,   10'd0} : (view_j == 3'd1) ? {1'b1, 9'd274, 10'd0,   10'd270} :
+                        (view_j == 3'd2) ? {1'b1, 9'd275, 10'd279, 10'd0} : (view_j == 3'd3) ? {1'b1, 9'd276, 10'd279, 10'd270} :
+                        (view_j == 3'd4) ? {1'b1, 9'd277, 10'd558, 10'd0} : 30'd0;
+wire [8:0]  ans_a     = 9'd96 + {3'd0, g_page_w, 1'b0} + {8'd0, view_j[0]};
+wire [29:0] ans_t     = (view_j < 3'd2) ? {1'b1, ans_a, 10'd113, (view_j[0] ? 10'd270 : 10'd0)} : 30'd0;
+wire [29:0] zoom_t    = (view_j == 3'd0) ? {1'b1, zcard[8:0], ZOOM_X[9:0], ZOOM_Y[9:0]} : 30'd0;
+wire [29:0] vt        = (g_view_w == 3'd1) ? map_t : (g_view_w == 3'd2) ? leaf_t : (g_view_w == 3'd3) ? ans_t :
+                        (g_view_w == 3'd4) ? notes_tile(g_page_w, view_j) : (g_view_w == 3'd5) ? gal_tile(g_gal_w, view_j) : zoom_t;
+wire        view_ok   = vt[29];
+wire [16:0] view_asset = {8'd0, vt[28:20]};
+wire [15:0] view_x    = {6'd0, vt[19:10]};
+wire [15:0] view_y    = {6'd0, vt[9:0]};
+wire        view_half = (g_view_w != 3'd6);
+// endgame panel items and suspect plates
+wire [2:0]  egj       = eg_need[0] ? 3'd0 : eg_need[1] ? 3'd1 : eg_need[2] ? 3'd2 : eg_need[3] ? 3'd3 : 3'd4;
+wire [16:0] eg_asset  = (egj == 3'd0) ? (g_win_w ? 17'd304 : 17'd303) : (egj == 3'd1) ? 17'd307 :
+                        (egj == 3'd2) ? 17'd308 : (egj == 3'd3) ? 17'd310 : 17'd309;
+wire [15:0] eg_x      = (egj == 3'd0) ? 16'd512 : (egj[0] ? EGB_X0 : EGB_X1);
+wire [15:0] eg_y      = (egj == 3'd0) ? 16'd8 : (egj < 3'd3) ? EGB_Y0 : EGB_Y1;
+wire [3:0]  susj      = sus_need[0] ? 4'd0 : sus_need[1] ? 4'd1 : sus_need[2] ? 4'd2 : sus_need[3] ? 4'd3 :
+                        sus_need[4] ? 4'd4 : sus_need[5] ? 4'd5 : sus_need[6] ? 4'd6 : sus_need[7] ? 4'd7 :
+                        sus_need[8] ? 4'd8 : sus_need[9] ? 4'd9 : 4'd10;
+wire [15:0] sus_y     = SUS_Y0 + {12'd0, susj} * SUS_PITCH;
+wire        eg_panel  = (g_eg_w[1] == 1'b0);   // play or accusation: Map/Suspects/thumbnails live
+wire        btn_j     = map_need[0] ? 1'b0 : 1'b1;
+wire [15:0] btn_x     = btn_j ? (MAP_X + BTN_PITCH) : MAP_X;
+wire [1:0] plate_j   = plate_need[0] ? 2'd0 : plate_need[1] ? 2'd1 : plate_need[2] ? 2'd2 : 2'd3;
+wire [15:0] plate_y  = PLATE_Y0 + {14'd0, plate_j} * PLATE_PITCH;
+wire [16:0] plate_asset = (g_phase_w == 2'd0) ? (A_DIFFICULTY + {15'd0, plate_j})
+                                              : (A_MODE + {15'd0, plate_j} - 17'd1);   // mode plates sit in rows 1-2
+wire       blit_free = !blit_inflight && (blit_req_r == blit_ack_w) && !blit_busy && (tape_frames_w != 17'd0) &&
+                       pf_done && !pf_wait && !pf_refill;
+always @(posedge CLK_40M) begin
+    pf_refill <= 1'b0;
+    if (reset) begin
+        ph_q <= 2'd3; plate_need <= 4'd0; card_need <= 6'd0; cards_q <= 6'd0; pf_wait <= 1'b0;
+        cm_q <= 2'd0; face_need <= 2'd0; zoom_need <= 1'b0;
+        map_need <= 2'd0; map_drawn <= 1'b0; blit_cm_q <= 1'b0;
+        view_need <= 6'd0; view_q <= 3'd0; view_close <= 1'b0;
+        gal_q <= 4'd0; eg_q <= 2'd0; eg_need <= 5'd0; sus_need <= 11'd0;
+        closed_v <= 3'd0; verdict_pend <= 1'b0;
+        retry_pend <= 1'b0; retry_cnt <= 2'd0;
+        cm_post <= 1'b0; cm_post_hold <= 1'b0; cm_post_tmr <= 28'd0;
+        blit_inflight <= 1'b0; blit_busy_q <= 1'b0; blit_wait_tmr <= 28'd0;
+    end else begin
+        ph_q <= g_phase_w; cards_q <= cards_revealed_w; cm_q <= g_cm_w;
+        blit_busy_q <= blit_busy;
+        if (blit_inflight) blit_wait_tmr <= blit_wait_tmr + 28'd1;
+        if (blit_busy_q && !blit_busy) blit_inflight <= 1'b0;                       // its decode finished
+        if (blit_busy_q && !blit_busy && !blit_ok && retry_cnt != 2'd3) begin      // ...or failed: redo it
+            retry_pend <= 1'b1;  retry_cnt <= retry_cnt + 2'd1;
+        end
+        if (!blit_busy && blit_wait_tmr == 28'hFFFFFFF) blit_inflight <= 1'b0;      // never started
+        if (pf_wait && !pf_done) pf_wait <= 1'b0;
+        card_need <= need_now;
+        if (blit_free && retry_pend) begin
+            blit_req_r    <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0;
+            retry_pend    <= 1'b0;
+        end else if (blit_free && zoom_need) begin
+            blit_frame_r <= tape_frames_w + zoom_asset;
+            blit_base_r  <= PANEL_BASE_HW + ZOOM_Y * CANVAS_W + {11'd0, ZOOM_X};
+            blit_dx_r    <= ZOOM_X;  blit_dy_r <= ZOOM_Y;
+            blit_half_r  <= 1'b0;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b1;
+            zoom_need    <= 1'b0;
+        end else if (blit_free && face_need != 2'd0) begin
+            blit_frame_r <= tape_frames_w + face_asset;
+            blit_base_r  <= PANEL_BASE_HW + FACE_Y * CANVAS_W + {11'd0, face_x};
+            blit_dx_r    <= face_x;  blit_dy_r <= FACE_Y;
+            blit_half_r  <= 1'b1;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b1;
+            face_need    <= face_need & ~(2'd1 << face_j);
+        end else if (blit_free && view_need != 6'd0) begin
+            if (view_ok) begin   // a view's tile; slots past its last tile are just cleared
+                blit_frame_r <= tape_frames_w + view_asset;
+                blit_base_r  <= PANEL_BASE_HW + view_y * CANVAS_W + {11'd0, view_x};
+                blit_dx_r    <= view_x;  blit_dy_r <= view_y;
+                blit_half_r  <= view_half;
+                blit_req_r   <= ~blit_req_r;
+                blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b1;
+            end
+            view_need    <= view_need & ~(6'd1 << view_j);
+        end else if (blit_free && g_view_w == 3'd0 && !view_close && !verdict_pend && eg_need != 5'd0) begin
+            blit_frame_r <= tape_frames_w + eg_asset;
+            blit_base_r  <= PANEL_BASE_HW + eg_y * CANVAS_W + {11'd0, eg_x};
+            blit_dx_r    <= eg_x;  blit_dy_r <= eg_y;
+            blit_half_r  <= 1'b1;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b0;
+            eg_need      <= eg_need & ~(5'd1 << egj);
+        end else if (blit_free && g_view_w == 3'd0 && !view_close && sus_need != 11'd0) begin
+            blit_frame_r <= tape_frames_w + A_SUSPECT + {13'd0, susj};
+            blit_base_r  <= PANEL_BASE_HW + sus_y * CANVAS_W + {11'd0, SUS_X};
+            blit_dx_r    <= SUS_X;  blit_dy_r <= sus_y;
+            blit_half_r  <= 1'b1;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b1;
+            sus_need     <= sus_need & ~(11'd1 << susj);
+        end else if (blit_free && !in_menu && eg_panel && g_view_w == 3'd0 && !view_close && map_need != 2'd0) begin
+            blit_frame_r <= tape_frames_w + A_BTN_MAP + {16'd0, btn_j};
+            blit_base_r  <= PANEL_BASE_HW + MAP_Y * CANVAS_W + {11'd0, btn_x};
+            blit_dx_r    <= btn_x;  blit_dy_r <= MAP_Y;
+            blit_half_r  <= 1'b1;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b0;
+            map_need     <= map_need & ~(2'd1 << btn_j);
+        end else if (blit_free && in_menu && plate_need != 4'd0) begin
+            blit_frame_r <= tape_frames_w + plate_asset;
+            blit_base_r  <= PANEL_BASE_HW + plate_y * CANVAS_W + {11'd0, PLATE_X};
+            blit_dx_r    <= PLATE_X;  blit_dy_r <= plate_y;
+            blit_half_r  <= 1'b1;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b0;
+            plate_need   <= plate_need & ~(4'd1 << plate_j);
+        end else if (blit_free && !in_menu && eg_panel && g_view_w == 3'd0 && !view_close && need_now != 6'd0) begin
+            blit_frame_r <= tape_frames_w + thumb_asset;
+            blit_base_r  <= slot_base;  blit_dx_r <= slot_x;  blit_dy_r <= slot_y;
+            blit_half_r  <= 1'b1;
+            blit_req_r   <= ~blit_req_r;
+            blit_inflight <= 1'b1; blit_wait_tmr <= 28'd0; retry_cnt <= 2'd0; blit_cm_q <= 1'b0;
+            card_need    <= need_now & ~(6'd1 << need_k);
+        end
+        // After B the tape jumps to the next segment and the display holds its last decoded frame
+        // (clue footage) until that seek primes. Keep the zoomed card up until the hold is over.
+        if (cm_q != 2'd0 && g_cm_w == 2'd0) begin
+            cm_post <= 1'b1; cm_post_hold <= 1'b0; cm_post_tmr <= 28'd0;
+        end else if (cm_post) begin
+            cm_post_tmr <= cm_post_tmr + 28'd1;
+            if (fb_seek_hold) cm_post_hold <= 1'b1;
+            if ((cm_post_hold && !fb_seek_hold) || cm_post_tmr == 28'd150_000_000 || in_menu) cm_post <= 1'b0;
+        end
+        // card moment changes: choose -> both faces; zoom -> the chosen face, full size
+        if (g_cm_w != cm_q) begin
+            face_need <= (g_cm_w == 2'd1) ? 2'b11 : 2'b00;
+            zoom_need <= (g_cm_w == 2'd2);
+            if (cm_q == 2'd0 && !map_drawn) begin map_need <= 2'b11; map_drawn <= 1'b1; end
+        end
+        // a new menu screen: repaint, then all of its plates (after the issue block so it wins)
+        if (g_phase_w != ph_q && in_menu) begin
+            pf_refill  <= 1'b1; pf_wait <= 1'b1;
+            plate_need <= (g_phase_w == 2'd0) ? 4'b1111 : 4'b0110;
+            card_need  <= 6'd0; face_need <= 2'd0; zoom_need <= 1'b0;
+            map_need   <= 2'd0; map_drawn <= 1'b0;
+            eg_need    <= 5'd0; sus_need <= 11'd0;
+        end
+        // A view opened (or the game-assets item changed): draw its tiles. Closed: the answer page and
+        // the clue zoom only covered the video column, so just the suspect plates (if showing) come back;
+        // anything wider repaints the panel and redraws what the current phase shows there.
+        view_q <= g_view_w;  gal_q <= g_gal_w;
+        if (g_view_w != view_q || (g_view_w == 3'd5 && g_gal_w != gal_q)) begin
+            view_need  <= (g_view_w != 3'd0) ? 6'b111111 : 6'b000000;
+            if (g_view_w == 3'd0) begin view_close <= 1'b1; closed_v <= view_q; end
+        end
+        if (view_close && !blit_inflight && g_view_w == 3'd0) begin
+            view_close <= 1'b0;
+            if (closed_v != 3'd3 && closed_v != 3'd6) begin
+                pf_refill  <= 1'b1; pf_wait <= 1'b1;
+                if (eg_panel) begin
+                    card_need <= cards_revealed_w;
+                    if (map_drawn) map_need <= 2'b11;
+                end else
+                    eg_need <= (g_eg_w == 2'd3) ? 5'b11111 : 5'b00111;
+            end
+            if (g_eg_w == 2'd1) sus_need <= 11'h7FF;
+        end
+        // Endgame: the accusation draws the suspect plates; the verdict clears the panel for the banner
+        // and Full Answer / Baley's Notes; the end adds Play Again / Game Assets.
+        eg_q <= g_eg_w;
+        if (g_eg_w != eg_q) begin
+            if (g_eg_w == 2'd1) sus_need <= 11'h7FF;
+            if (g_eg_w == 2'd2) begin
+                verdict_pend <= 1'b1;
+                sus_need  <= 11'd0;  card_need <= 6'd0;  map_need <= 2'd0;
+            end
+            if (g_eg_w == 2'd3) eg_need <= eg_need | 5'b11000;
+        end
+        if (verdict_pend && !blit_inflight) begin
+            verdict_pend <= 1'b0;
+            pf_refill <= 1'b1; pf_wait <= 1'b1;
+            eg_need   <= eg_need | 5'b00111;
+        end
+    end
+end
+
+// Menu selection border: 6 px around the selected plate, drawn at scanout once the screen is complete.
+wire [1:0] sel_row   = (g_phase_w == 2'd0) ? g_packet_w : {1'b0, g_pick_w} + 2'd1;
+wire [15:0] sel_y    = PLATE_Y0 + {14'd0, sel_row} * PLATE_PITCH;
+wire       menu_ready = in_menu && plate_need == 4'd0 && pf_done && !pf_wait && !blit_inflight && !retry_pend;
+wire       in_outer  = (rr_hpos + 16'd6 >= PLATE_X) && (rr_hpos < PLATE_X + PLATE_W + 16'd6) &&
+                       (rr_vpos + 16'd6 >= sel_y)   && (rr_vpos < sel_y + PLATE_H + 16'd6);
+wire       in_inner  = (rr_hpos >= PLATE_X) && (rr_hpos < PLATE_X + PLATE_W) &&
+                       (rr_vpos >= sel_y)   && (rr_vpos < sel_y + PLATE_H);
+wire       sel_px    = menu_ready && in_outer && !in_inner;
+
+// Card moment: the whole 512-wide video column is packet colour except the card art, which is
+// revealed only once drawn; in choose mode a white border marks the face under the cursor.
+wire       cm_on     = (disp_cm != 2'd0) && (rr_hpos < 16'd512);
+// A request the streamer has not taken yet also holds the reveal (it can wait out a post-seek audio refill).
+wire       blit_pend = (blit_req_r != blit_ack_w);
+// Original: wire cm_ready = !zoom_need && face_need == 2'd0 && !(blit_inflight && blit_cm_q);
+wire       cm_ready  = !zoom_need && face_need == 2'd0 && !((blit_inflight || blit_pend || retry_pend) && blit_cm_q);
+wire       in_zoom   = (rr_hpos >= ZOOM_X) && (rr_hpos < ZOOM_X + ZOOM_W) && (rr_vpos >= ZOOM_Y) && (rr_vpos < ZOOM_Y + ZOOM_H);
+wire       in_face0  = (rr_hpos >= FACE_X0) && (rr_hpos < FACE_X0 + FACE_W) && (rr_vpos >= FACE_Y) && (rr_vpos < FACE_Y + FACE_H);
+wire       in_face1  = (rr_hpos >= FACE_X1) && (rr_hpos < FACE_X1 + FACE_W) && (rr_vpos >= FACE_Y) && (rr_vpos < FACE_Y + FACE_H);
+wire [15:0] cur_x    = g_cm_sel_w ? FACE_X1 : FACE_X0;
+wire       in_cur_o  = (rr_hpos + 16'd6 >= cur_x) && (rr_hpos < cur_x + FACE_W + 16'd6) &&
+                       (rr_vpos + 16'd6 >= FACE_Y) && (rr_vpos < FACE_Y + FACE_H + 16'd6);
+wire       cm_art    = cm_ready && ((disp_cm == 2'd2) ? in_zoom : (in_face0 || in_face1));
+wire       cm_border = cm_ready && (g_cm_w == 2'd1) && in_cur_o && !cm_art;
+wire [23:0] pk_rgb   = (g_packet_w == 2'd0) ? 24'h2E9E44 :      // Beginner green
+                       (g_packet_w == 2'd1) ? 24'hF2D02A :      // Intermediate yellow
+                       (g_packet_w == 2'd2) ? 24'hC82A2A :      // Advanced red
+                                              24'h222222;       // Expert black
+wire [23:0] cm_rgb   = cm_border ? 24'hFFFFFF : pk_rgb;
+wire       cm_fill   = cm_on && !cm_art;
+// Original: assign comp_r = sel_px ? 8'hFF : rr_r;  (and _g/_b)
+// During play the column strips above/below the video are plain background (they hold stale card art).
+// Scanout overlay (2026-09-25), priority: card moment > open view > accusation column > play.
+//   view      : its art rect shows the panel buffer once every tile is drawn (background until then);
+//               the rest of the video column is packet colour
+//   accusation: the video column is packet colour with the suspect plates; the plate under the cursor
+//               gets a border, red/white pulsing once armed
+//   play      : column strips, menu selection border, panel cursor border
+// Previous version kept below (commented) for reference.
+// // Study view: background until every tile is drawn, then the panel buffer (video is off).
+// wire       view_ready = (view_need == 5'd0) && !(blit_inflight && blit_cm_q);
+// wire [15:0] view_w    = (g_view_w == 2'd1) ? 16'd586 : 16'd837;
+// wire       view_on   = (g_view_w != 2'd0) && (rr_hpos < view_w) && (rr_vpos < 16'd540);
+// wire       view_fill = view_on && !view_ready;
+// // Panel cursor: 6 px white border around the focused button or card thumbnail.
+// wire [15:0] foc_x    = (g_focus_w == 4'd1) ? MAP_X : (g_focus_w == 4'd2) ? (MAP_X + BTN_PITCH) :
+//                        (g_focus_w == 4'd3 || g_focus_w == 4'd6) ? SLOT_X0 :
+//                        (g_focus_w == 4'd4 || g_focus_w == 4'd7) ? SLOT_X1 : SLOT_X2;
+// wire [15:0] foc_y    = (g_focus_w < 4'd3) ? MAP_Y : (g_focus_w < 4'd6) ? SLOT_Y0 : SLOT_Y1;
+// wire [15:0] foc_w    = (g_focus_w < 4'd3) ? 16'd213 : 16'd140;
+// wire [15:0] foc_h    = (g_focus_w < 4'd3) ? 16'd70  : 16'd161;
+// wire       foc_o     = (rr_hpos + 16'd6 >= foc_x) && (rr_hpos < foc_x + foc_w + 16'd6) &&
+//                        (rr_vpos + 16'd6 >= foc_y) && (rr_vpos < foc_y + foc_h + 16'd6);
+// wire       foc_i     = (rr_hpos >= foc_x) && (rr_hpos < foc_x + foc_w) && (rr_vpos >= foc_y) && (rr_vpos < foc_y + foc_h);
+// wire       foc_px    = (g_focus_w != 4'd0) && (g_view_w == 2'd0) && (disp_cm == 2'd0) && !in_menu && foc_o && !foc_i;
+// // Original: wire strip_px = !in_menu && !cm_on && (rr_hpos < 16'd512) && ...
+// wire       strip_px  = !in_menu && !cm_on && (g_view_w == 2'd0) && (rr_hpos < 16'd512) && ((rr_vpos < 16'd30) || (rr_vpos >= 16'd510) && (rr_vpos < 16'd540));
+// // Original: assign comp_r = cm_fill ? cm_rgb[23:16] : strip_px ? 8'h10 : sel_px ? 8'hFF : rr_r;
+// // assign comp_r = cm_fill ? cm_rgb[23:16] : (strip_px || view_fill) ? 8'h10 : (sel_px || foc_px) ? 8'hFF : rr_r;
+// // assign comp_g = cm_fill ? cm_rgb[15:8]  : (strip_px || view_fill) ? 8'h14 : (sel_px || foc_px) ? 8'hFF : rr_g;
+// // assign comp_b = cm_fill ? cm_rgb[7:0]   : (strip_px || view_fill) ? 8'h18 : (sel_px || foc_px) ? 8'hFF : rr_b;
+reg  [24:0] blink_ctr = 25'd0;
+always @(posedge CLK_40M) blink_ctr <= blink_ctr + 25'd1;
+wire        blink     = blink_ctr[24];
+wire        col       = (rr_hpos < 16'd512);
+wire        view_act  = (g_view_w != 3'd0) && !in_menu;
+wire        view_ready = (view_need == 6'd0) && !((blit_inflight || blit_pend || retry_pend) && blit_cm_q);
+wire [19:0] ngeo      = notes_geo(g_page_w);
+wire [15:0] va_x      = (g_view_w == 3'd3) ? 16'd113 : (g_view_w == 3'd6) ? ZOOM_X : 16'd0;
+wire [15:0] va_y      = (g_view_w == 3'd4) ? {6'd0, ngeo[19:10]} : (g_view_w == 3'd6) ? ZOOM_Y : 16'd0;
+wire [15:0] va_w      = (g_view_w == 3'd1) ? 16'd586 : (g_view_w == 3'd2) ? 16'd837 :
+                        (g_view_w == 3'd3) ? 16'd285 : (g_view_w == 3'd6) ? ZOOM_W : 16'd960;
+wire [15:0] va_h      = (g_view_w == 3'd4) ? {6'd0, ngeo[9:0]} : (g_view_w == 3'd6) ? ZOOM_H : 16'd540;
+wire        in_va     = (rr_hpos >= va_x) && (rr_hpos < va_x + va_w) && (rr_vpos >= va_y) && (rr_vpos < va_y + va_h);
+// accusation
+function in_plate(input [31:0] dy);   // dy inside one of the 11 plates (44 rows each, pitch 46)
+    integer k;
+    begin
+        in_plate = 1'b0;
+        for (k = 0; k < 11; k = k + 1)
+            if (dy >= 46 * k && dy < 46 * k + 44) in_plate = 1'b1;
+    end
+endfunction
+wire        acc_on    = (g_eg_w == 2'd1) && !view_act && !in_menu && col;
+wire        sus_ready = (sus_need == 11'd0) && !((blit_inflight || blit_pend || retry_pend) && blit_cm_q);
+wire [15:0] sdy       = rr_vpos - SUS_Y0;
+wire        sus_plate = sus_ready && (rr_hpos >= SUS_X) && (rr_hpos < SUS_X + SUS_W) && (rr_vpos >= SUS_Y0) && in_plate({16'd0, sdy});
+wire        sus_foc   = (g_focus_w >= 5'd9) && (g_focus_w <= 5'd19);
+wire [4:0]  sfk       = g_focus_w - 5'd9;
+wire [15:0] sfy       = SUS_Y0 + {11'd0, sfk} * SUS_PITCH;
+wire        sus_bo    = sus_ready && sus_foc &&
+                        (rr_hpos + 16'd2 >= SUS_X) && (rr_hpos < SUS_X + SUS_W + 16'd2) &&
+                        (rr_vpos + 16'd2 >= sfy) && (rr_vpos < sfy + SUS_H + 16'd2) &&
+                        !((rr_hpos >= SUS_X) && (rr_hpos < SUS_X + SUS_W) && (rr_vpos >= sfy) && (rr_vpos < sfy + SUS_H));
+wire [23:0] sus_bc    = (g_armed_w && blink) ? 24'hE02020 : 24'hFFFFFF;
+// panel cursor border: Map/Suspects, card thumbnails, endgame buttons
+wire        foc_eg    = (g_focus_w >= 5'd20);
+wire [15:0] foc_x     = foc_eg ? (g_focus_w[0] ? EGB_X1 : EGB_X0) :
+                        (g_focus_w == 5'd1) ? MAP_X : (g_focus_w == 5'd2) ? (MAP_X + BTN_PITCH) :
+                        (g_focus_w == 5'd3 || g_focus_w == 5'd6) ? SLOT_X0 :
+                        (g_focus_w == 5'd4 || g_focus_w == 5'd7) ? SLOT_X1 : SLOT_X2;
+wire [15:0] foc_y     = foc_eg ? (g_focus_w[1] ? EGB_Y1 : EGB_Y0) :
+                        (g_focus_w < 5'd3) ? MAP_Y : (g_focus_w < 5'd6) ? SLOT_Y0 : SLOT_Y1;
+wire [15:0] foc_w     = (foc_eg || g_focus_w < 5'd3) ? 16'd213 : 16'd140;
+wire [15:0] foc_h     = (foc_eg || g_focus_w < 5'd3) ? 16'd70  : 16'd161;
+wire        foc_o     = (rr_hpos + 16'd6 >= foc_x) && (rr_hpos < foc_x + foc_w + 16'd6) &&
+                        (rr_vpos + 16'd6 >= foc_y) && (rr_vpos < foc_y + foc_h + 16'd6);
+wire        foc_i     = (rr_hpos >= foc_x) && (rr_hpos < foc_x + foc_w) && (rr_vpos >= foc_y) && (rr_vpos < foc_y + foc_h);
+wire        foc_item  = ((g_focus_w >= 5'd1) && (g_focus_w <= 5'd8)) || foc_eg;
+wire        foc_px    = foc_item && !view_act && (disp_cm == 2'd0) && !in_menu && foc_o && !foc_i &&
+                        !(foc_eg && eg_need != 5'd0);   // endgame buttons: border once they are drawn
+wire        strip_px  = !in_menu && !cm_on && !view_act && (g_eg_w != 2'd1) && col &&
+                        ((rr_vpos < 16'd30) || (rr_vpos >= 16'd510) && (rr_vpos < 16'd540));
+wire [23:0] BG_RGB    = 24'h101418;
+wire [23:0] rr_rgb    = {rr_r, rr_g, rr_b};
+wire [23:0] comp_rgb  = cm_fill  ? cm_rgb :
+                        view_act ? (in_va ? (view_ready ? rr_rgb : BG_RGB) : col ? pk_rgb : rr_rgb) :
+                        acc_on   ? (sus_bo ? sus_bc : sus_plate ? rr_rgb : pk_rgb) :
+                        strip_px ? BG_RGB :
+                        (sel_px || foc_px) ? 24'hFFFFFF : rr_rgb;
+assign comp_r = comp_rgb[23:16];
+assign comp_g = comp_rgb[15:8];
+assign comp_b = comp_rgb[7:0];
+
 reg  [2:0]  fb_prime_cnt;
 reg  [27:0]  fb_seek_tmr;
 reg         fb_wr_stale;   // frame decoding when the seek hit -> finish it, but never publish it
@@ -659,7 +1304,8 @@ always @(posedge CLK_40M) begin
         // decoder finished: publish it, move writing to the free buffer.
         // Ordered AFTER the adopt block so its fb_have_new<=1'b1 wins on a simultaneous cycle
         // (we adopted the old ready, and this newly finished frame is immediately pending).
-        if (dec_frame_done) begin
+        // Original: if (dec_frame_done) begin   -- a blit decode is not a video frame
+        if (dec_frame_done && !fetch_blit_w) begin
             fb_ready_idx <= fb_wr_idx;
             fb_wr_idx    <= fb_free_idx;   // != fb_next_disp by construction
             // SEEK-HOLD: a frame that was mid-decode when the seek hit is from the OLD disc
@@ -720,21 +1366,35 @@ fb_writer #(
     .FB_COLS   (FB_COLS_HW),
     .FB_ROWS   (FB_ROWS_HW),
     .CLEAR_ROWS(FB_ROWS_HW),
-    .COALESCE  (1'b0) // Disabled!
+    .COALESCE  (1'b0), // Disabled!
+    .PANEL_STRIDE(CANVAS_W)
 ) fb_wr (
     .clk(CLK_40M), .reset(reset),
     .px_we(dec_px_we), .px_x(dec_px_x), .px_y(dec_px_y),
     .px_r(dec_px_r), .px_g(dec_px_g), .px_b(dec_px_b),
     .px_ready(dec_px_ready),
     .fill_idle(rr_fill_idle),       // WRITE-GATE-2026-07-16: yield DDR while the raster reader fetches (delete on revert)
-    .base_hw(fb_wr_base),
+    // Original: .base_hw(fb_wr_base),
+    .base_hw(fetch_blit_w ? blit_base_a : fb_wr_base),
+    .panel(fetch_blit_w), .half(blit_half_a), .clip_w(blit_clip_w), .clip_h(blit_clip_h),
     .wraddr(fb_wraddr), .din(fb_din),
     .din64(fb_din64), .be64(fb_be64),   // WRITE-STAGE-A-2026-07-20
     .we_req(fb_we_req), .we_ack(fb_we_ack)
 );
 
-ddram ddram_fb (
-    .DDRAM_CLK(CLK_40M),
+// Panel background. TEMPORARY test grid until a real panel background asset exists.
+wire [27:1] pf_addr;
+wire [15:0] pf_din;
+wire  [1:0] pf_be;
+wire        pf_we, pf_req, pf_ack;
+fb_panel_fill #(.W(CANVAS_W), .H(CANVAS_H), .BASE(PANEL_BASE_HW)) panel_fill (
+    .clk(CLK_40M), .reset(reset), .refill(pf_refill),
+    .r_addr(pf_addr), .r_din(pf_din), .r_be(pf_be), .r_we(pf_we),
+    .r_req(pf_req), .r_ack(pf_ack), .done(pf_done)
+);
+
+fb_ddr fb_ddr_i (
+    .clk(CLK_40M),
     .DDRAM_BUSY(DDRAM_BUSY),
     .DDRAM_BURSTCNT(DDRAM_BURSTCNT),
     .DDRAM_ADDR(DDRAM_ADDR),
@@ -744,16 +1404,15 @@ ddram ddram_fb (
     .DDRAM_DIN(DDRAM_DIN),
     .DDRAM_BE(DDRAM_BE),
     .DDRAM_WE(DDRAM_WE),
-    // write port (fb_writer)
-    .wraddr(fb_wraddr), .din(fb_din),
-    .din64(fb_din64), .be64(fb_be64),   // WRITE-STAGE-A-2026-07-20
+    // word writes (fb_writer)
+    .wraddr(fb_wraddr), .din64(fb_din64), .be64(fb_be64),
     .we_req(fb_we_req), .we_ack(fb_we_ack),
-    // rom read/write port — unused
-    .rdaddr(27'd0), .dout(), .rom_din(16'd0), .rom_be(2'd0),
-    .rom_we(1'b0), .rom_req(1'b0), .rom_ack(),
-    // second read port — raster reader (DDR framebuffer -> video)
-    .rdaddr2(rr_rdaddr2), .dout2(rr_dout2), .dout2_64(rr_dout2_64),   // READ-COALESCE-2026-07-20
-    .rd_req2(rr_rd_req2), .rd_ack2(rr_rd_ack2)
+    // line-burst reads (raster reader)
+    .lr_addr(rr_lr_addr), .lr_len(rr_lr_len), .lr_req(rr_lr_req), .lr_ack(rr_lr_ack),
+    .lr_data(rr_lr_data), .lr_valid(rr_lr_valid),
+    // random halfword port — panel filler
+    .rdaddr(pf_addr), .dout(), .rom_din(pf_din), .rom_be(pf_be),
+    .rom_we(pf_we), .rom_req(pf_req), .rom_ack(pf_ack)
 );
 
 // Read the framebuffer back in scan order, then composite the LED band over it.
@@ -780,6 +1439,9 @@ fb_raster_reader #(
     .VID_W      (FB_COLS_HW),
     .VID_H      (FB_ROWS_HW),
     .BG         (CANVAS_BG),
+    .BURST      (8'd16),            // HPS f2sdram wedges on 128-word read bursts; 16 is proven
+    .PANEL_EN   (1'b1),
+    .PANEL_BASE (PANEL_BASE_HW),
     // RES-512x480-FIX-2026-07-24: was 3'd1 (clk/2, 66.8 Hz). HW result: **bottom of the picture cut
     // off** -- the classic fill-stall signature. The reader must fetch H_ACT/4 = 128 words inside ONE
     // line-time; at clk/2 that is 576*2 = 1152 cycles = only 9 cycles per DDR request, which it
@@ -871,14 +1533,18 @@ fb_raster_reader #(
 ) rr (
     .clk(CLK_40M), .reset(reset),
     .frame_base_hw(fb_rd_base),             // FB-DOUBLEBUF-2026-07-15: was hardcoded 27'd0, see fb_buf_sel above
-    .rdaddr2(rr_rdaddr2), .dout2(rr_dout2), .dout2_64(rr_dout2_64),   // READ-COALESCE-2026-07-20
-    .rd_req2(rr_rd_req2), .rd_ack2(rr_rd_ack2),
+    // Original: .vid_en(g_phase_w == 2'd2 && disp_cm == 2'd0),
+    // Original: .vid_en(g_phase_w == 2'd2 && disp_cm == 2'd0 && g_view_w == 2'd0),
+    .vid_en(g_phase_w == 2'd2 && disp_cm == 2'd0 && g_view_w == 3'd0 && g_eg_w != 2'd1),  // video is covered in the menus and during a card moment
+    .lr_addr(rr_lr_addr), .lr_len(rr_lr_len), .lr_req(rr_lr_req), .lr_ack(rr_lr_ack),
+    .lr_data(rr_lr_data), .lr_valid(rr_lr_valid),
     .fill_idle(rr_fill_idle),               // WRITE-GATE-2026-07-16 (delete on revert)
     .ce_pix(rr_ce_pix),
     .hsync(rr_hs), .vsync(rr_vs), .hblank(rr_hblank), .vblank(rr_vblank),
     .hpos(rr_hpos), .vpos(rr_vpos),
     .vid_r(rr_r), .vid_g(rr_g), .vid_b(rr_b)
 );
+
 
 
 endmodule

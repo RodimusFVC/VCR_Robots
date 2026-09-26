@@ -1,75 +1,57 @@
 //============================================================================
 // fb_raster_reader.v — DDR framebuffer -> raster video (for arcade_video)
 //----------------------------------------------------------------------------
-// Reads a 320x240 RGB565 framebuffer out of HPS DDR3 (written by fb_writer via
-// ddram.sv) in RASTER scan order and produces a standard video raster
-// (ce_pix + hs/vs/hblank/vblank + RGB888) to feed the core's normal
-// arcade_video path.  This is the screenshot-friendly route: everything goes
-// through the same core-video pipeline the LED band + capture already use
-// (MISTER_FB is NOT used).
+// Scans RGB565 framebuffers out of HPS DDR3 in raster order and produces a
+// standard video raster (ce_pix + hs/vs/hblank/vblank + RGB888).
 //
-// DDR reads use ddram.sv's second read port (rdaddr2/dout2/rd_req2/rd_ack2 —
-// 16-bit halfword, toggle handshake).  A ping-pong line buffer hides DDR
-// latency: line N is displayed from one buffer while line N+1 is fetched into
-// the other (a full line-time of slack, so timing is not tight).
+// The canvas is H_ACT x (V_BAND + V_ACT). Two sources per line:
+//   panel : (PANEL_EN) one full-width canvas row from a single panel buffer
+//           at PANEL_BASE (stride H_ACT); otherwise the canvas is BG.
+//   video : the frame at frame_base_hw, shown in a VID_W x VID_H window at
+//           (VID_X, V_BAND + VID_Y) on top of the panel while vid_en is high.
+// Each source row is fetched on fb_ddr's line port in bursts of up to BURST
+// words into its own ping-pong line buffer: line N is displayed from one half
+// while line N+1 lands in the other. The swap at end of line only happens
+// once every fetch for the next line has landed, otherwise the current line
+// repeats -- a stutter, never a torn line. fline (the row being fetched) is
+// resynced to the raster once per frame, which is also when frame_base_hw
+// and vid_en are latched, so one displayed frame always comes from one state.
 //
-// REVERT-2026-07-15: an intermediate version of this file cached two COMPLETE
-// on-chip frame buffers (~150KB each) to avoid re-reading DDR every raster
-// refresh -- reverted, way too much BRAM, and it was solving the wrong
-// problem. The actual root cause (found the same session, user's diagnosis):
-// dlv_streamer.v was redundantly re-fetching/re-decoding/re-writing the SAME
-// mjpeg frame to DDR several times per real content frame (its 30Hz pacing
-// tick didn't check whether the mapped frame had actually changed), hammering
-// fb_writer and the DDR bus far more than a genuine ~24fps content rate ever
-// would. That's fixed at the source now (see dlv_streamer.v, tag
-// REDUNDANT-REDRAW-FIX-2026-07-15) -- this file goes back to the cheap 2-line
-// buffer, which only needs to keep up with genuine content updates now.
-//
-// The caller composites the LED band over the RGB output.  Instantiated
-// feeding arcade_video #(320,24), frame_base_hw = the DDR halfword base of
-// the frame to display (top level toggles this via fb_buf_sel).
+// Alignment: VID_X, VID_W, STRIDE, H_ACT and every base must be multiples of
+// 4 halfwords (one 64-bit word); VID_W and H_ACT must be <= 1024.
 //============================================================================
 module fb_raster_reader #(
     parameter [15:0] H_ACT  = 16'd320,
     parameter [15:0] V_ACT  = 16'd240,
-    parameter [15:0] STRIDE = 16'd320,     // halfwords per row (= H_ACT, tight)
-    parameter [15:0] V_BAND = 16'd0,       // LAYOUT-2026-07-04 (Option B, grow canvas): reserved top strip for the LED band.
-                                           //   Total active height becomes V_ACT + V_BAND.  Display rows 0..V_BAND-1 are
-                                           //   forced black (band lives there); rows V_BAND..V_BAND+V_ACT-1 show the FULL
-                                           //   video (row R -> framebuffer row R-V_BAND).  Video is NEVER cropped/scaled.
-                                           //   V_BAND=0 => old behaviour (no band).
+    parameter [15:0] STRIDE = 16'd320,     // video framebuffer halfwords per row
+    parameter [15:0] V_BAND = 16'd0,       // rows above the canvas forced black
     parameter [15:0] H_FP = 16'd8, H_SYNC = 16'd32, H_BP = 16'd24,
     parameter [15:0] V_FP = 16'd8, V_SYNC = 16'd4,  V_BP = 16'd16,
-    // RES-512x480-2026-07-24: ce_pix = clk / 2^CE_DIV_LOG2.  Was hardwired to clk/8, which at
-    // 320x240 gave 384*280*8 = 860,160 cyc = 21.5 ms = 46.5 Hz.  At 512x480 the raster is
-    // 576*520, so clk/8 would be 59.9 ms = 16.7 Hz -- BELOW the 23.938 fps content rate, i.e. we
-    // would drop frames at the display.  clk/2 gives 14.98 ms = 66.8 Hz, comfortably above it.
-    // This is also the BANDWIDTH DIAL: DDR read traffic scales directly with refresh rate, so if
-    // 512x480 turns out to be bandwidth-starved, raise this to 3'd2 (clk/4 = 33.4 Hz) and halve
-    // the read load before touching anything structural.
-    parameter [2:0]  CE_DIV_LOG2 = 3'd3,
-    // Video window inside the H_ACT x V_ACT canvas; outside it the reader outputs BG (no DDR reads).
-    parameter [15:0] VID_X = 16'd0,          // must be a multiple of 4
-    parameter [15:0] VID_Y = 16'd0,          // rows below the band
-    parameter [15:0] VID_W = H_ACT,          // halfwords fetched per video row (multiple of 4, <= 1024)
+    parameter [2:0]  CE_DIV_LOG2 = 3'd3,   // ce_pix = clk / 2^CE_DIV_LOG2
+    // Video window inside the H_ACT x V_ACT canvas.
+    parameter [15:0] VID_X = 16'd0,
+    parameter [15:0] VID_Y = 16'd0,
+    parameter [15:0] VID_W = H_ACT,
     parameter [15:0] VID_H = V_ACT,
-    parameter [15:0] BG    = 16'h0000        // RGB565 canvas background
+    parameter [15:0] BG    = 16'h0000,     // RGB565 canvas colour when PANEL_EN = 0
+    parameter        PANEL_EN   = 1'b0,    // 1: canvas comes from the panel buffer
+    parameter [26:0] PANEL_BASE = 27'd0,   // panel buffer halfword base (stride H_ACT)
+    parameter [7:0]  BURST = 8'd16         // words per line-port request (128 wedges the HPS bridge)
 )(
-    input             clk,            // CLK_40M (= DDRAM_CLK)
-    input             reset,          // active-high
-    input      [26:0] frame_base_hw,  // DDR halfword base of the frame to display
+    input             clk,
+    input             reset,               // active-high
+    input      [26:0] frame_base_hw,       // DDR halfword base of the video frame to display
+    input             vid_en,              // show the video window (else the panel shows through)
 
-    // ddram.sv read port 2
-    output reg [26:0] rdaddr2,
-    input      [15:0] dout2,
-    input      [63:0] dout2_64,     // READ-COALESCE-2026-07-20: whole cached word (4 halfwords)
-    output reg        rd_req2,
-    input             rd_ack2,
+    // fb_ddr line port
+    output reg [24:0] lr_addr,             // 64-bit word address (= halfword address >> 2)
+    output reg [7:0]  lr_len,
+    output reg        lr_req,
+    input             lr_ack,
+    input      [63:0] lr_data,
+    input             lr_valid,
 
-    // WRITE-GATE-2026-07-16 (new port, no original to restore -- delete on revert): high while the
-    // fill FSM is PARKED, i.e. this line's fetch already landed and is just waiting for the
-    // end-of-line swap, so there is no read2 traffic in flight and fb_writer may use the DDR bus.
-    // Low while a fetch is running => fb_writer must yield.  See fb_writer.v's matching tag.
+    // high while no fetch is in flight (fb_writer may use the bus)
     output            fill_idle,
 
     // video raster out (-> arcade_video)
@@ -78,22 +60,19 @@ module fb_raster_reader #(
     output reg        vsync,
     output reg        hblank,
     output reg        vblank,
-    output reg [15:0] hpos,           // aligned (x,y) of the pixel now on vid_*
-    output reg [15:0] vpos,           //   (for the LED-band compositor)
+    output reg [15:0] hpos,                // aligned (x,y) of the pixel now on vid_*
+    output reg [15:0] vpos,
     output     [7:0]  vid_r,
     output     [7:0]  vid_g,
     output     [7:0]  vid_b
 );
-    // Option B (grow canvas): total active rows = full video rows + the reserved band.  The video
-    // keeps ALL V_ACT rows (never cropped/scaled); the band just adds V_BAND rows of active height.
     localparam [15:0] V_DISP  = V_ACT + V_BAND;
     localparam [15:0] H_TOTAL = H_ACT + H_FP + H_SYNC + H_BP;
     localparam [15:0] V_TOTAL = V_DISP + V_FP + V_SYNC + V_BP;
+    localparam [15:0] VID_WORDS = VID_W >> 2;
+    localparam [15:0] PAN_WORDS = H_ACT >> 2;
 
-    // pixel clock enable = clk / 2^CE_DIV_LOG2  (RES-512x480-2026-07-24; was hardwired clk/8).
-    // The counter still free-runs over its full 3 bits; only the compare mask narrows, so
-    // CE_DIV_LOG2=3 reproduces the original clk/8 exactly. Mask is built 4 bits wide first because
-    // (3'd1 << 3) would wrap to 0 in 3 bits.
+    // pixel clock enable
     localparam [3:0] CE_MASK4 = (4'd1 << CE_DIV_LOG2) - 4'd1;
     localparam [2:0] CE_MASK  = CE_MASK4[2:0];
     reg [2:0] cediv = 3'd0;
@@ -102,170 +81,149 @@ module fb_raster_reader #(
 
     // raster counters
     reg [15:0] hcnt = 16'd0, vcnt = 16'd0;
-    wire h_last = (hcnt == H_TOTAL - 16'd1);
-    wire v_last = (vcnt == V_TOTAL - 16'd1);
+    wire h_last   = (hcnt == H_TOTAL - 16'd1);
+    wire v_last   = (vcnt == V_TOTAL - 16'd1);
     wire h_active = (hcnt < H_ACT);
-    wire v_active = (vcnt < V_DISP);   // active rows 0..V_DISP-1 = band strip + full video (Option B)
-    wire [15:0] vid_x  = hcnt - VID_X;                    // named wire: no expression bit-select in .v
+    wire v_active = (vcnt < V_DISP);
+    wire [15:0] vid_x  = hcnt - VID_X;     // named wire: no expression bit-select in a .v file
     wire        in_vid = (hcnt >= VID_X) && (hcnt < VID_X + VID_W) &&
                          (vcnt >= V_BAND + VID_Y) && (vcnt < V_BAND + VID_Y + VID_H);
 
-    // ping-pong line buffer: 2 lines, 512-halfword stride (matches the
-    // {buf, hcnt[8:0]} / {buf, fidx[8:0]} index — H_ACT<=512).
-    reg  [15:0] linebuf [0:2047];            // 2 lines x 1024 halfwords, index {buf, x[9:0]}
+    // ping-pong line buffers, 2 lines x 256 words each, index {buf, word[7:0]}
+    reg  [63:0] lb_vid [0:511];
+    reg  [63:0] lb_pan [0:511];
     reg         disp_buf = 1'b0;
     wire        fill_buf = ~disp_buf;
 
-    // display read (registered BRAM read) + aligned timing, MERGED with the DDR fill FSM below into
-    // one always block -- FILL-STALL-FIX-2026-07-15: fill_done_q is shared state between the two
-    // (display consumes/clears it, fill FSM sets it), and Verilog requires a reg to be written from
-    // exactly one always block -- can't split them and assign fill_done_q from both.
-    reg [15:0] pix_q;
+    reg [63:0] vword_q, pword_q;           // registered BRAM reads
+    reg  [1:0] vlane_q, plane_q;           // which halfword of each word is this pixel
     reg        active_q;
-    reg        vid_q;          // pixel in pix_q lies inside the video window
+    reg        vid_q;                      // pixel comes from the video window
 
-    // ---- DDR fill FSM state: fetch fline into fill_buf, self-paced (NOT tied to a one-line
-    // deadline). Previously gated on a once-per-raster-line pulse and always targeted `vcnt+1` --
-    // i.e. assumed the fetch would always finish inside one line-time. Under DDR write contention
-    // that assumption could fail, and the old unconditional end-of-line buffer swap then exposed a
-    // half-filled buffer -- the black-line-comb bug. Now the FSM keeps fetching the SAME target for
-    // as long as it takes (it doesn't return to F_IDLE until done, so it's immune to line-boundary
-    // pressure) and the swap below only fires once fill_done_q confirms the target actually landed.
-    // Worst case under contention: a line repeats for a few extra line-times -- never a torn buffer.
-    // READ-COALESCE-2026-07-20: one DDR request now yields FOUR halfwords.
-    // WHY: ddram.sv caches a 64-bit word per read port and dout2 slices ONE halfword out of it, so
-    // the old one-request-per-pixel loop issued 320 requests/line where 80 suffice. dout2_64 (an
-    // ADDITIVE output on ddram.sv, no behaviour change there) exposes the whole cached word, so we
-    // request every 4th halfword and unpack locally.
-    // ALIGNMENT (checked, load-bearing): STRIDE=320 and H_ACT=320 are both /4, and every framebuffer
-    // base (0, 76800, 153600) is /4, so rdaddr2[2:1]==00 on every request we issue => ram_q2 holds
-    // exactly linebuf[fidx..fidx+3], low halfword in bits [15:0]. If H_ACT or STRIDE ever stops
-    // being a multiple of 4, or a base becomes unaligned, THIS BREAKS -- add a tail path first.
-    // linebuf is single-write-port BRAM, so the 4 halfwords are stored over 4 cycles (F_ST1..3)
-    // from a latched copy; that costs cycles but NOT DDR transactions, which is the point (it frees
-    // arbiter bandwidth for fb_writer, whose px_ready is gated on this FSM being idle).
-    localparam F_IDLE = 2'd0, F_REQ = 2'd1, F_WAIT = 2'd2, F_STORE = 2'd3;
-    reg [1:0]  fst  = F_IDLE;
-    reg [47:0] fw_hold;      // halfwords 1..3 awaiting store (hw0 is written directly on ack)
-    reg [1:0]  fw_cnt;       // which of the remaining 3 is being stored
-    reg [15:0] fw_idx;       // linebuf index for the current F_STORE write (named reg on purpose:
-                             // Quartus 17 elaborates .v as Verilog-2001, where (expr)[8:0] is illegal)
-    reg [15:0] fidx;
-    reg [15:0] fline;
-    reg        fill_done_q;    // 1 once fline's data is fully loaded into fill_buf, awaiting the swap below
-    wire [15:0] fline_next = (fline == V_TOTAL - 16'd1) ? 16'd0 : fline + 16'd1;
-    wire [15:0] frow       = fline - V_BAND - VID_Y;   // framebuffer row for the line being fetched
-
-    // VSYNC-RESYNC-2026-07-15: the fill FSM's content-row target (fline) runs decoupled from raster
-    // timing (vcnt) so a stalled fetch can be repeated instead of torn -- but with no periodic
-    // resync, any single stall would permanently offset fline's own wrap point from vcnt's forever
-    // after (both free-run mod V_TOTAL independently). Force a hard resync once per raster frame
-    // (`resync_pending`, set on `v_last`). Applied ONLY at F_IDLE with no fetch outstanding -- never
-    // abandons an unacknowledged rd_req2 mid-flight, which would desync ddram.sv's toggle handshake
-    // (stock third-party file, must not be touched, and its protocol must not be violated from our
-    // side either) -- so at most one halfword's delay before it takes effect, never unbounded drift.
+    // fill FSM
+    localparam F_IDLE = 3'd0, F_PAN = 3'd1, F_VID = 3'd2, F_WAIT = 3'd3;
+    reg  [2:0] fst = F_IDLE;
+    reg        seg;                        // 0 = panel, 1 = video: which line buffer lr_data goes to
+    reg  [7:0] widx;                       // next line-buffer word to store
+    reg  [7:0] left;                       // words of this segment not yet requested
+    reg [15:0] fline;                      // display line being fetched
+    reg        fill_done_q;                // fline has fully landed, awaiting the swap
     reg        resync_pending;
-
-    // FB-DOUBLEBUF-2026-07-15: latch the buffer base once per raster frame, tied to the same
-    // resync_pending pulse above -- not the raw frame_base_hw port, which the top level toggles live
-    // as the decoder finishes frames (see Arcade-DragonsLair.sv fb_buf_sel). Without this latch,
-    // frame_base_hw could flip mid-scan and different lines of the SAME displayed frame would be
-    // fetched from two different buffers -- root cause of the original black-line-comb bug:
-    // fb_writer and this reader used to share one hardcoded buffer with no swap at all.
-    reg [26:0] frame_base_hw_q;
+    reg [26:0] frame_base_hw_q;            // latched once per frame
+    reg        vid_en_q;                   // latched once per frame
+    initial begin lr_req = 1'b0; lr_addr = 25'd0; lr_len = 8'd0; end
+    wire [15:0] fline_next = (fline == V_TOTAL - 16'd1) ? 16'd0 : fline + 16'd1;
+    wire [15:0] frow       = fline - V_BAND - VID_Y;              // video framebuffer row for fline
+    wire [15:0] prow       = fline - V_BAND;                      // panel row for fline
+    wire [26:0] row_hw     = frame_base_hw_q + frow * STRIDE;     // halfword address of the video row
+    wire [26:0] prow_hw    = PANEL_BASE + prow * H_ACT;           // halfword address of the panel row
+    wire        want_vid   = vid_en_q && (fline >= V_BAND + VID_Y) && (frow < VID_H);
+    wire        want_pan   = PANEL_EN && (fline >= V_BAND) && (prow < V_ACT);
+    // Skip panel words the video window hides (window flush with the left or right canvas edge).
+    localparam [15:0] VID_X_W   = VID_X >> 2;
+    localparam [15:0] VID_END_W = (VID_X + VID_W) >> 2;
+    wire        hide       = want_vid && (VID_X_W == 16'd0 || VID_END_W == PAN_WORDS);
+    wire [7:0]  pan_first  = (hide && VID_X_W == 16'd0) ? VID_END_W[7:0] : 8'd0;
+    wire [7:0]  pan_words  = !hide ? PAN_WORDS[7:0] :
+                             (VID_X_W == 16'd0) ? (PAN_WORDS[7:0] - VID_END_W[7:0]) : VID_X_W[7:0];
+    wire [26:0] pan_hw     = prow_hw + {17'd0, pan_first, 2'b00};
 
     always @(posedge clk) begin
         if (reset) begin
             hcnt <= 0; vcnt <= 0; disp_buf <= 1'b0;
             hsync <= 0; vsync <= 0; hblank <= 1; vblank <= 1; active_q <= 0; vid_q <= 0;
             hpos <= 16'd0; vpos <= 16'd0;
-            fst <= F_IDLE; fidx <= 16'd0; rd_req2 <= 1'b0; rdaddr2 <= 27'd0;
-            frame_base_hw_q <= 27'd0;
+            fst <= F_IDLE; widx <= 8'd0;   // lr_req keeps its value: fb_ddr may still be finishing a burst
+            frame_base_hw_q <= frame_base_hw;      // never scan the buffer the writer starts on
+            vid_en_q <= vid_en;
             fline <= 16'd0; fill_done_q <= 1'b0; resync_pending <= 1'b0;
-            fw_hold <= 48'd0; fw_cnt <= 2'd0; fw_idx <= 16'd0;   // READ-COALESCE-2026-07-20
         end else begin
-            // ---- display timing (ce_pix-gated) ----
+            // ---- display timing (ce_pix-gated); never stalls on the fetch ----
             if (ce_pix) begin
-                // read this pixel and register the aligned timing flags
-                pix_q    <= linebuf[{disp_buf, vid_x[9:0]}];   // plain registered read keeps BRAM inference
-                vid_q    <= in_vid;
-                active_q <= h_active & v_active & (vcnt >= V_BAND);  // reserved top strip -> black (LED band composites there)
+                vword_q  <= lb_vid[{disp_buf, vid_x[9:2]}];
+                pword_q  <= lb_pan[{disp_buf, hcnt[9:2]}];
+                vlane_q  <= vid_x[1:0];
+                plane_q  <= hcnt[1:0];
+                vid_q    <= in_vid & vid_en_q;
+                active_q <= h_active & v_active & (vcnt >= V_BAND);
                 hpos     <= hcnt;   vpos <= vcnt;
                 hblank   <= ~h_active;
                 vblank   <= ~v_active;
                 hsync    <= (hcnt >= H_ACT + H_FP) && (hcnt < H_ACT + H_FP + H_SYNC);
                 vsync    <= (vcnt >= V_DISP + V_FP) && (vcnt < V_DISP + V_FP + V_SYNC);
-                // advance counters -- raster/hsync/vsync timing ALWAYS advances on schedule,
-                // independent of fetch progress (never stall the video timing itself, that's a
-                // framework/HDMI risk).
                 if (h_last) begin
                     hcnt <= 16'd0;
                     vcnt <= v_last ? 16'd0 : vcnt + 16'd1;
-                    // FILL-STALL-FIX-2026-07-15: only swap to the other buffer if its fetch actually
-                    // finished. If still running, repeat the current line's content for one more
-                    // line-time instead of tearing -- a rare stutter, not corruption.
+                    // swap only if the next line has landed; otherwise repeat this one
                     if (fill_done_q) begin
                         disp_buf    <= ~disp_buf;
                         fill_done_q <= 1'b0;
                     end
-                    if (v_last) resync_pending <= 1'b1;   // VSYNC-RESYNC-2026-07-15: request a resync, applied below when safe
+                    if (v_last) resync_pending <= 1'b1;
                 end else begin
                     hcnt <= hcnt + 16'd1;
                 end
             end
 
-            // ---- DDR fill FSM (runs every clk, not just ce_pix -- needs the full bandwidth) ----
+            // ---- fill FSM (every clk): panel segment, then video segment ----
             case (fst)
             F_IDLE:
                 if (!fill_done_q) begin
-                    fidx <= 16'd0;
-                    fst  <= F_REQ;
+                    fst <= F_PAN;
                     if (resync_pending) begin
-                        // VSYNC-RESYNC-2026-07-15: hard-realign to the new frame instead of continuing
-                        // fline's own (possibly drifted) sequence -- fline=1 matches the steady-state
-                        // "always one row ahead of what's on screen" convention used elsewhere.
-                        fline           <= 16'd1;
+                        fline           <= 16'd1;      // one row ahead of the raster
                         frame_base_hw_q <= frame_base_hw;
+                        vid_en_q        <= vid_en;
                         resync_pending  <= 1'b0;
                     end else begin
                         fline <= fline_next;
                     end
                 end
-            F_REQ:
-                // display line `fline` shows framebuffer row (fline - V_BAND); rows inside the
-                // reserved band (fline < V_BAND) fetch nothing (they're blanked to black anyway).
-                if (fline >= V_BAND + VID_Y && frow < VID_H) begin
-                    rdaddr2 <= frame_base_hw_q + frow*STRIDE + fidx;
-                    rd_req2 <= ~rd_req2;                    // issue read
+            F_PAN:
+                if (lr_ack != lr_req) begin
+                    // previous burst still returning (only possible right after a reset): wait it out
+                end else if (want_pan && pan_words != 8'd0) begin
+                    lr_addr <= pan_hw[26:2];
+                    lr_len  <= (pan_words > BURST) ? BURST : pan_words;
+                    left    <= (pan_words > BURST) ? pan_words - BURST : 8'd0;
+                    lr_req  <= ~lr_req;
+                    seg     <= 1'b0;
+                    widx    <= pan_first;             // line-buffer word = canvas word position
                     fst     <= F_WAIT;
                 end else begin
-                    fst         <= F_IDLE;                  // band line or off-screen: nothing to fetch
+                    fst <= F_VID;
+                end
+            F_VID:
+                if (want_vid) begin
+                    lr_addr <= row_hw[26:2];
+                    lr_len  <= (VID_WORDS[7:0] > BURST) ? BURST : VID_WORDS[7:0];
+                    left    <= (VID_WORDS[7:0] > BURST) ? VID_WORDS[7:0] - BURST : 8'd0;
+                    lr_req  <= ~lr_req;
+                    seg     <= 1'b1;
+                    widx    <= 8'd0;
+                    fst     <= F_WAIT;
+                end else begin
+                    fst         <= F_IDLE;             // nothing (more) to fetch for this line
                     fill_done_q <= 1'b1;
                 end
-            F_WAIT:
-                if (rd_ack2 == rd_req2) begin               // dout2/dout2_64 valid
-                    // READ-COALESCE-2026-07-20: store halfword 0 now, hold 1..3 for F_STORE.
-                    linebuf[{fill_buf, fidx[9:0]}] <= dout2_64[15:0];
-                    fw_hold <= dout2_64[63:16];
-                    fw_cnt  <= 2'd0;
-                    fw_idx  <= fidx + 16'd1;     // named reg: NO expression bit-select in a .v file
-                    fst     <= F_STORE;
+            F_WAIT: begin
+                if (lr_valid) begin
+                    if (seg) lb_vid[{fill_buf, widx}] <= lr_data;
+                    else     lb_pan[{fill_buf, widx}] <= lr_data;
+                    widx <= widx + 8'd1;
                 end
-            F_STORE: begin
-                // write halfwords 1,2,3 of the fetched word on successive cycles
-                linebuf[{fill_buf, fw_idx[9:0]}] <= fw_hold[15:0];
-                fw_hold <= {16'd0, fw_hold[47:16]};
-                fw_idx  <= fw_idx + 16'd1;
-                if (fw_cnt == 2'd2) begin
-                    if (fidx + 16'd4 >= VID_W) begin        // whole line landed
+                if (lr_ack == lr_req) begin          // last word of this burst arrives on this same edge
+                    if (left != 8'd0) begin          // next burst of the same segment
+                        lr_addr <= lr_addr + {17'd0, lr_len};
+                        lr_len  <= (left > BURST) ? BURST : left;
+                        left    <= (left > BURST) ? left - BURST : 8'd0;
+                        lr_req  <= ~lr_req;
+                    end else if (!seg) begin
+                        fst <= F_VID;                // panel row done, now the video row
+                    end else begin
                         fst         <= F_IDLE;
                         fill_done_q <= 1'b1;
-                    end else begin
-                        fidx <= fidx + 16'd4;
-                        fst  <= F_REQ;
                     end
-                end else begin
-                    fw_cnt <= fw_cnt + 2'd1;
                 end
             end
             default: fst <= F_IDLE;
@@ -273,12 +231,15 @@ module fb_raster_reader #(
         end
     end
 
-    // WRITE-GATE-2026-07-16: fill_done_q is set only when a line's fetch has fully landed, and the
-    // F_IDLE state does nothing while it's high -- so it is exactly "the fill FSM is not touching
-    // read2 right now".  (Delete this assign + the port on revert.)
     assign fill_idle = fill_done_q;
 
-    wire [15:0] px = vid_q ? pix_q : BG;
+    wire [15:0] vpx = (vlane_q == 2'd0) ? vword_q[15:0]  :
+                      (vlane_q == 2'd1) ? vword_q[31:16] :
+                      (vlane_q == 2'd2) ? vword_q[47:32] : vword_q[63:48];
+    wire [15:0] ppx = (plane_q == 2'd0) ? pword_q[15:0]  :
+                      (plane_q == 2'd1) ? pword_q[31:16] :
+                      (plane_q == 2'd2) ? pword_q[47:32] : pword_q[63:48];
+    wire [15:0] px  = vid_q ? vpx : (PANEL_EN ? ppx : BG);
     assign vid_r = active_q ? {px[15:11], px[15:13]} : 8'd0;  // 5->8
     assign vid_g = active_q ? {px[10:5],  px[10:9]}  : 8'd0;  // 6->8
     assign vid_b = active_q ? {px[4:0],   px[4:2]}   : 8'd0;  // 5->8

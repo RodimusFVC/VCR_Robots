@@ -237,29 +237,42 @@ reg signed [31:0] r_conv_r;
 reg signed [31:0] g_conv_r;
 reg signed [31:0] b_conv_r;
 
-wire signed [31:0] cr_1_402_w = (cr_value_w * 5743) >>> 12; // cr_value_w * 1.402
-wire signed [31:0] cr_0_714_w = (cr_value_w * 2925) >>> 12; // cr_value_w * 0.71414
-wire signed [31:0] cb_0_344_w = (cb_value_w * 1410) >>> 12; // cb_value_w * 0.34414
-wire signed [31:0] cb_1_772_w = (cb_value_w * 7258) >>> 12; // cb_value_w * 1.772
+// TIMING-PIPE-2026-09-25: RAM output -> 4 multiplies -> adds -> clamp was one cycle and failed timing by ~11 ns.
+// Now three stages (A: raw values + coordinates, B: products, C: sums/clamp = the original output
+// regs), all advancing on output_space_w exactly as the single stage did. Original combinational
+// products (from the RAM outputs) kept below for reference:
+// wire signed [31:0] cr_1_402_w = (cr_value_w * 5743) >>> 12; // cr_value_w * 1.402
+// wire signed [31:0] cr_0_714_w = (cr_value_w * 2925) >>> 12; // cr_value_w * 0.71414
+// wire signed [31:0] cb_0_344_w = (cb_value_w * 1410) >>> 12; // cb_value_w * 0.34414
+// wire signed [31:0] cb_1_772_w = (cb_value_w * 7258) >>> 12; // cb_value_w * 1.772
+reg               va_q, vb_q;
+reg signed [31:0] ya_q, cba_q, cra_q, yb_q;
+reg signed [31:0] cr_1_402_q, cr_0_714_q, cb_0_344_q, cb_1_772_q;
+reg        [15:0] xa_q, yya_q, xb_q, yyb_q;
+wire signed [31:0] cr_1_402_w = cr_1_402_q;
+wire signed [31:0] cr_0_714_w = cr_0_714_q;
+wire signed [31:0] cb_0_344_w = cb_0_344_q;
+wire signed [31:0] cb_1_772_w = cb_1_772_q;
+wire signed [31:0] y_stage_w  = yb_q;
 
 always @ *
 begin
-    valid_r  = active_q;
+    valid_r  = active_q;   // pop control (unchanged); the conversion below uses stage B
     r_conv_r = 32'b0;
     g_conv_r = 32'b0;
     b_conv_r = 32'b0;
 
     if (img_mode_i == JPEG_MONOCHROME)
     begin
-        r_conv_r = 128 + y_value_w;
-        g_conv_r = 128 + y_value_w;
-        b_conv_r = 128 + y_value_w;
+        r_conv_r = 128 + y_stage_w;   // TIMING-PIPE-2026-09-25 was y_value_w
+        g_conv_r = 128 + y_stage_w;
+        b_conv_r = 128 + y_stage_w;
     end
     else// if (img_mode_i == JPEG_YCBCR_444)
     begin
-        r_conv_r = 128 + y_value_w + cr_1_402_w;
-        g_conv_r = 128 + y_value_w - cb_0_344_w - cr_0_714_w;
-        b_conv_r = 128 + y_value_w + cb_1_772_w;
+        r_conv_r = 128 + y_stage_w + cr_1_402_w;   // TIMING-PIPE-2026-09-25 was y_value_w
+        g_conv_r = 128 + y_stage_w - cb_0_344_w - cr_0_714_w;
+        b_conv_r = 128 + y_stage_w + cb_1_772_w;
     end
 end
 
@@ -278,14 +291,36 @@ reg [7:0]  pixel_r_q;
 reg [7:0]  pixel_g_q;
 reg [7:0]  pixel_b_q;
 
-always @ (posedge clk_i )
-if (rst_i)
-    valid_q <= 1'b0;
-else if (output_space_w)
-    valid_q <= valid_r && (id_value_w[31:30] != BLOCK_EOF);
-
 wire [31:0] x_start_w = {13'b0, id_value_w[15:0],3'b0};
 wire [31:0] y_start_w = {15'b0, id_value_w[29:16],3'b0};
+
+// TIMING-PIPE-2026-09-25 original: valid_q <= valid_r && (id != EOF); pixel_x/y_q <= start + idx  (now stage A)
+always @ (posedge clk_i )
+if (rst_i)
+begin
+    va_q <= 1'b0; vb_q <= 1'b0; valid_q <= 1'b0;
+end
+else if (output_space_w)
+begin
+    va_q    <= valid_r && (id_value_w[31:30] != BLOCK_EOF);
+    vb_q    <= va_q;
+    valid_q <= vb_q;
+end
+
+always @ (posedge clk_i )
+if (output_space_w)
+begin
+    /* verilator lint_off WIDTH */
+    xa_q  <= x_start_w + (idx_q % 8);
+    yya_q <= y_start_w + (idx_q / 8);
+    /* verilator lint_on WIDTH */
+    ya_q  <= y_value_w;  cba_q <= cb_value_w;  cra_q <= cr_value_w;
+    xb_q  <= xa_q;  yyb_q <= yya_q;  yb_q <= ya_q;
+    cr_1_402_q <= (cra_q * 5743) >>> 12;
+    cr_0_714_q <= (cra_q * 2925) >>> 12;
+    cb_0_344_q <= (cba_q * 1410) >>> 12;
+    cb_1_772_q <= (cba_q * 7258) >>> 12;
+end
 
 always @ (posedge clk_i )
 if (rst_i)
@@ -295,10 +330,8 @@ begin
 end
 else if (output_space_w)
 begin
-    /* verilator lint_off WIDTH */
-    pixel_x_q <= x_start_w + (idx_q % 8);
-    pixel_y_q <= y_start_w + (idx_q / 8);
-    /* verilator lint_on WIDTH */
+    pixel_x_q <= xb_q;
+    pixel_y_q <= yyb_q;
 end
 
 always @ (posedge clk_i )
@@ -337,7 +370,8 @@ else if (img_start_i)
 else if (id_valid_w && id_value_w[31:30] == BLOCK_EOF)
     idle_q <= 1'b1;
 
-assign idle_o = idle_q;
+// TIMING-PIPE-2026-09-25 original: assign idle_o = idle_q;  (now also waits for the new stages to drain)
+assign idle_o = idle_q && !va_q && !vb_q;
 
 
 endmodule

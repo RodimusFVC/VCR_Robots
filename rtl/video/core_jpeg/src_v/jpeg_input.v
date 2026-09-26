@@ -111,20 +111,22 @@ else if (inport_valid_i && inport_accept_w)
 //-----------------------------------------------------------------
 // Token decoder
 //-----------------------------------------------------------------
-wire token_soi_w  = (last_b_q == 8'hFF && data_r == 8'hd8);
-wire token_sof0_w = (last_b_q == 8'hFF && data_r == 8'hc0);
-wire token_dqt_w  = (last_b_q == 8'hFF && data_r == 8'hdb);
-wire token_dht_w  = (last_b_q == 8'hFF && data_r == 8'hc4);
-wire token_eoi_w  = (last_b_q == 8'hFF && data_r == 8'hd9);
-wire token_sos_w  = (last_b_q == 8'hFF && data_r == 8'hda);
-wire token_pad_w  = (last_b_q == 8'hFF && data_r == 8'h00);
+// Qualified by inport_valid_i: during a bubble data_r shows a stale byte that can pair with last_b_q into a false marker.
+wire token_ff_w   = inport_valid_i && (last_b_q == 8'hFF);
+wire token_soi_w  = (token_ff_w && data_r == 8'hd8);
+wire token_sof0_w = (token_ff_w && data_r == 8'hc0);
+wire token_dqt_w  = (token_ff_w && data_r == 8'hdb);
+wire token_dht_w  = (token_ff_w && data_r == 8'hc4);
+wire token_eoi_w  = (token_ff_w && data_r == 8'hd9);
+wire token_sos_w  = (token_ff_w && data_r == 8'hda);
+wire token_pad_w  = (token_ff_w && data_r == 8'h00);
 
 // Unsupported
-wire token_sof2_w = (last_b_q == 8'hFF && data_r == 8'hc2);
-wire token_dri_w  = (last_b_q == 8'hFF && data_r == 8'hdd);
-wire token_rst_w  = (last_b_q == 8'hFF && data_r >= 8'hd0 && data_r <= 8'hd7);
-wire token_app_w  = (last_b_q == 8'hFF && data_r >= 8'he0 && data_r <= 8'hef);
-wire token_com_w  = (last_b_q == 8'hFF && data_r == 8'hfe);
+wire token_sof2_w = (token_ff_w && data_r == 8'hc2);
+wire token_dri_w  = (token_ff_w && data_r == 8'hdd);
+wire token_rst_w  = (token_ff_w && data_r >= 8'hd0 && data_r <= 8'hd7);
+wire token_app_w  = (token_ff_w && data_r >= 8'he0 && data_r <= 8'hef);
+wire token_com_w  = (token_ff_w && data_r == 8'hfe);
 
 //-----------------------------------------------------------------
 // FSM
